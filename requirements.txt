@@ -1,0 +1,10 @@
+torch==2.2.0
+torchvision==0.17.0
+ultralytics==8.2.0
+pyyaml
+lapx
+filterpy
+torchreid
+gdown
+tensorboard
+numpy
