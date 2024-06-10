@@ -8,3 +8,6 @@ torchreid
 gdown
 tensorboard
 numpy
+prompt_toolkit
+ffmpeg-python
+timecode

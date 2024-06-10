@@ -1,5 +1,4 @@
 import numpy as np
-from collections import deque
 from ultralytics.trackers.basetrack import BaseTrack, TrackState
 from ultralytics.trackers.bot_sort import BOTrack, BOTSORT
 from ultralytics.trackers.utils import matching
@@ -9,22 +8,27 @@ import torch
 import cv2
 import copy
 
+from visual_race_timing.prompts import ask_for_id
+
 
 class RaceTracker(BOTSORT):
     def __init__(
             self,
             model_weights,
             args,
-            frame_rate=30
+            frame_rate=30,
+            participants=None,
+            device="0"
     ):
         super().__init__(args, frame_rate)
         self.half = False
-        self.device = "cuda"
+        self.device = device
         self.unknowns = {}
+        self.participants = participants
         if args.with_reid:
             self.feature_extractor = torchreid.utils.FeatureExtractor(model_name='osnet_ain_x1_0',
                                                                       model_path=model_weights,
-                                                                      device='cuda')
+                                                                      device=self.device)
 
     def update(self, results, img=None):
         """Updates object tracker with new detections and returns tracked object bounding boxes."""
@@ -42,17 +46,9 @@ class RaceTracker(BOTSORT):
         cls = results.cls
 
         remain_inds = scores > self.args.track_high_thresh
-        inds_low = scores > self.args.track_low_thresh
-        inds_high = scores < self.args.track_high_thresh
 
-        inds_second = np.logical_and(inds_low, inds_high)
-        dets_second = bboxes[inds_second]
         dets = bboxes[remain_inds]
         xyxys = xyxys[remain_inds]
-        scores_keep = scores[remain_inds]
-        scores_second = scores[inds_second]
-        cls_keep = cls[remain_inds]
-        cls_second = cls[inds_second]
 
         if len(xyxys > 0):
             crops = self.get_crops(xyxys, img)
@@ -81,60 +77,65 @@ class RaceTracker(BOTSORT):
         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.args.match_thresh)
         emb_dists = matching.embedding_distance(strack_pool, detections)
 
+
         # Step 3: Deal with the unmatched
         track_ids = [t.track_id for t in strack_pool]
-        for inew in u_detection:
+        for _, inew in enumerate(u_detection):
             annotator = Annotator(
                 copy.deepcopy(img),
             )
-            annotator.box_label(detections[inew].xyxy, color=colors(0))
+            annotator.box_label(detections[inew].xyxy, label=f"{scores[inew]:.2f} {_ + 1}/{len(u_detection)}", color=colors(0))
             cv2.imshow("Race Tracking", annotator.result())
             cv2.waitKey(1)
             if len(strack_pool) == 0:
-                user_input = input("New ID")
-                while True:
-                    try:
-                        new_id = int(user_input, 16)
-                        break
-                    except ValueError:
-                        user_input = input("New ID")
-                track = detections[inew]
-                track.activate(self.kalman_filter, self.frame_id)
-                track.track_id = new_id
-                activated_stracks.append(track)
+                # No one to match with, new track
+                user_input = ask_for_id([(bib.lower(), (name,)) for bib, name in self.participants.items()], allow_other=True)
+                if user_input[0] == 'U':
+                    name = user_input[1:].strip()
+                    det = detections[inew]
+                    det.activate(self.kalman_filter, self.frame_id)
+                    det.track_id = 0xF00 + len(self.unknowns)
+                    activated_stracks.append(det)
+                    self.unknowns[det.track_id] = name
+                    continue
+                elif user_input.strip().lower() == 'skip':
+                    continue
+                else:
+                    det = detections[inew]
+                    det.activate(self.kalman_filter, self.frame_id)
+                    det.track_id = int(user_input, 16)
+                    activated_stracks.append(det)
                 continue
 
             matched_tracks = [match[0] for match in matches]
             # Mask embedding dist for matched tracks
             emb_dists[matched_tracks] = 1
-            iclosest = np.argmin(emb_dists[:, inew])
+            # Get (at most) the 5 closest embeddings
+            emb_dist_ranking = np.argsort(emb_dists[:, inew])
+            match_emb_dists = emb_dists[emb_dist_ranking, inew]
             det = detections[inew]
-            track = strack_pool[iclosest]
-            print(f"re-ID as {hex(track.track_id)[2:]}?")
-            user_input = input("Y(es)/U(nknown)/Other ID")
-            user_input = user_input.strip()
-            if 'Y' in user_input[0] or 'y' in user_input[0]:
-                # track.re_activate(det, self.frame_id, new_id=False)
-                # refind_stracks.append(track)
-                # matched_tracks.append(iclosest)
-                matches.append([iclosest, inew])
-            elif 'U' in user_input[0] or 'u' in user_input[0]:
+            closest_tracks = [strack_pool[i] for i in emb_dist_ranking[:5]]
+            dists = list(match_emb_dists[:5])
+            bibs = [hex(track.track_id)[2:] for track in closest_tracks]
+            bibs.extend([bib for bib in self.participants.keys() if bib not in bibs])
+            bibs.extend([format(bib, '04x').lower() for bib in self.unknowns.keys() if bib not in bibs])
+            names = [self.participants.get(bib, '') for bib in bibs]
+            names = [name if name else self.unknowns.get(bib, '') for name, bib in zip(names, bibs)]
+            dists.extend([1 for _ in range(len(names)- len(dists))])
+            user_input = ask_for_id([(bib, (name, f"{dist:.2f}")) for bib, name, dist in zip(bibs, names, dists)], show_default=False, allow_other=True)
+            if user_input[0].lower() == 'u':
                 name = user_input[1:].strip()
                 det.activate(self.kalman_filter, self.frame_id)
                 det.track_id = 0xF00 + len(self.unknowns)
                 activated_stracks.append(det)
                 self.unknowns[det.track_id] = name
-
+            elif user_input.strip().lower() == 'skip':
+                continue
             else:
-                while True:
-                    try:
-                        other_id = int(user_input, 16)
-                        break
-                    except ValueError:
-                        user_input = input("Y/Other ID")
-
-                if other_id in track_ids:
-                    itracked = track_ids.index(other_id)
+                bib_id = int(user_input, 16)
+                if bib_id in track_ids:
+                    itracked = track_ids.index(bib_id)
+                    # We may have matched this track earliier so we need to update the match
                     matched_tracks = [match[0] for match in matches]
                     if itracked in matched_tracks:
                         wrong_match_idx = matched_tracks.index(itracked)
@@ -145,7 +146,7 @@ class RaceTracker(BOTSORT):
                 else:
                     # First time a person is tracked
                     det.activate(self.kalman_filter, self.frame_id)
-                    det.track_id = other_id
+                    det.track_id = bib_id
                     activated_stracks.append(det)
 
         # Step 4: Update tracks

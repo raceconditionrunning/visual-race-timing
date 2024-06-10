@@ -76,3 +76,53 @@ def side_of_line(p1, p2, points):
         1,
         0
     )
+
+
+def point_to_line_distance(points, p1, p2):
+    """Calculate the distance from points to the line segment p1p2 in batch."""
+    points, p1, p2 = map(np.array, (points, p1, p2))
+    line_vec = p2 - p1
+    point_vec = points - p1
+    line_len = np.linalg.norm(line_vec, axis=1, keepdims=True)
+    line_unitvec = line_vec / line_len
+    proj_len = np.einsum('ij,ij->i', point_vec, line_unitvec)
+    proj_vec = proj_len[:, np.newaxis] * line_unitvec
+
+    nearest_point = p1 + proj_vec
+    nearest_point = np.where(proj_len[:, np.newaxis] < 0, p1, nearest_point)
+    nearest_point = np.where(proj_len[:, np.newaxis] > line_len, p2, nearest_point)
+
+    return np.linalg.norm(nearest_point - points, axis=1)
+
+
+def line_segment_to_box_distance(p1, p2, boxes):
+    """Calculate the shortest distance from a line segment to multiple bounding boxes in batch."""
+    p1, p2 = np.atleast_2d(p1), np.atleast_2d(p2)
+    boxes = np.array(boxes)
+
+    # Check if the line segment intersects any of the boxes
+    intersections = line_segment_intersects_boxes(p1, p2, boxes)
+
+    distances = np.full(intersections.shape, np.inf)
+
+    # For each box, calculate the minimum distance to the edges if there's no intersection
+    xmin, ymin, xmax, ymax = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+
+    top_left = np.column_stack((xmin, ymin))
+    top_right = np.column_stack((xmax, ymin))
+    bottom_left = np.column_stack((xmin, ymax))
+    bottom_right = np.column_stack((xmax, ymax))
+
+    edges = [
+        (top_left, top_right),
+        (top_right, bottom_right),
+        (bottom_right, bottom_left),
+        (bottom_left, top_left)
+    ]
+
+    for p1_edge, p2_edge in edges:
+        d1 = point_to_line_distance(p1_edge, p1, p2)
+        d2 = point_to_line_distance(p2_edge, p1, p2)
+        distances = np.minimum(distances, np.minimum(d1, d2))
+
+    return np.where(intersections, 0, distances)

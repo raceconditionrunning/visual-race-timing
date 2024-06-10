@@ -2,13 +2,12 @@ track_high_thresh: 0.1 # threshold for the first association
 track_low_thresh: 0.05 # threshold for the second association
 new_track_thresh: 0.6 # threshold for init new track if the detection does not match any tracks
 track_buffer: 10000 # buffer to calculate the time when to remove tracks
-match_thresh: 0.99 # threshold for matching tracks
+match_thresh: 0.60 # threshold for matching tracks
 # min_box_area: 10  # threshold for min box areas(for tracker evaluation, not used for now)
 # mot20: False  # for tracker evaluation(not used for now)
 
 # BoT-SORT settings
 gmc_method: sparseOptFlow # method of global motion compensation
-# ReID model related thresh (not supported yet)
-proximity_thresh: 0.0
+proximity_thresh: 0.1 # IOU/dist thresh for matching
 appearance_thresh: 0.25
 with_reid: true
