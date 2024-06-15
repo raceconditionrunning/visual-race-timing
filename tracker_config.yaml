@@ -1,13 +1,13 @@
 track_high_thresh: 0.1 # threshold for the first association
 track_low_thresh: 0.05 # threshold for the second association
 new_track_thresh: 0.6 # threshold for init new track if the detection does not match any tracks
-track_buffer: 10000 # buffer to calculate the time when to remove tracks
-match_thresh: 0.60 # threshold for matching tracks
+track_buffer: 10 # Seconds beyond which to require manual ID entry when reactivating a track
+match_thresh: 0.60 # threshold for matching tracks. There's a cost based on IOU. Lower cost is better. Below this thresh of cost, accept match
 # min_box_area: 10  # threshold for min box areas(for tracker evaluation, not used for now)
 # mot20: False  # for tracker evaluation(not used for now)
 
 # BoT-SORT settings
 gmc_method: sparseOptFlow # method of global motion compensation
-proximity_thresh: 0.1 # IOU/dist thresh for matching
+proximity_thresh: 0.08 # IOU/dist thresh for matching
 appearance_thresh: 0.25
 with_reid: true

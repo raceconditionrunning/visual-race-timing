@@ -29,14 +29,16 @@ class RaceTracker(BOTSORT):
             self.feature_extractor = torchreid.utils.FeatureExtractor(model_name='osnet_ain_x1_0',
                                                                       model_path=model_weights,
                                                                       device=self.device)
+        # HACK: Monkey patch so we get hex print outs to match bibs
+        BOTrack.__str__ =  lambda self: f"OT_{format(self.track_id, '02x')}_({self.start_frame}-{self.end_frame})"
 
     def update(self, results, img=None):
         """Updates object tracker with new detections and returns tracked object bounding boxes."""
         self.frame_id += 1
-        activated_stracks = []
+        activated_stracks = [] # Active and detected within this update
         refind_stracks = []
-        lost_stracks = []
-        removed_stracks = []
+        lost_stracks = [] # Temporarily unmatched, but could come back momentarily
+        removed_stracks = [] # Assumed gone. Requires human intervention to re-activate
 
         scores = results.conf
         bboxes = results.xywhr if hasattr(results, "xywhr") else results.xywh
@@ -58,27 +60,22 @@ class RaceTracker(BOTSORT):
             features = []
 
         detections = [BOTrack(xyxy, s, c, f) for (xyxy, s, c, f) in zip(dets, scores, cls, features)]
-        '''
-        # Add newly detected tracklets to tracked_stracks
-        unconfirmed = []
-        tracked_stracks = []  # type: list[STrack]
-        for track in self.tracked_stracks:
-            if not track.is_activated:
-                unconfirmed.append(track)
-            else:
-                tracked_stracks.append(track)
-        '''
-        # Step 2: First association, with high score detection boxes
-        strack_pool = self.joint_stracks(self.tracked_stracks, self.lost_stracks)
-        # Predict the current location with KF
-        self.multi_predict(strack_pool)
 
+        # Step 1: First association, with high score detection boxes
+        strack_pool = self.joint_stracks(self.tracked_stracks, self.lost_stracks)
+        # Predict updates for tracked or recently-tracked objects
+        self.multi_predict(strack_pool)
+        # We'll consider all the tracks, but later we'll disqualify the removed ones from some matchings
+        strack_pool = self.joint_stracks(strack_pool, self.removed_stracks)
+        removed_track_i = [i for i, t in enumerate(strack_pool) if t.state == TrackState.Removed]
+        # Calculate track-to-detection cost matrix (lower cost => better match)
         dists = self.get_dists(strack_pool, detections)
+        dists[removed_track_i, :] = np.inf
         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.args.match_thresh)
         emb_dists = matching.embedding_distance(strack_pool, detections)
 
 
-        # Step 3: Deal with the unmatched
+        # Step 2: Deal with the unmatched
         track_ids = [t.track_id for t in strack_pool]
         for _, inew in enumerate(u_detection):
             annotator = Annotator(
@@ -116,9 +113,9 @@ class RaceTracker(BOTSORT):
             det = detections[inew]
             closest_tracks = [strack_pool[i] for i in emb_dist_ranking[:5]]
             dists = list(match_emb_dists[:5])
-            bibs = [hex(track.track_id)[2:] for track in closest_tracks]
+            bibs = [format(track.track_id, '02x').lower() for track in closest_tracks]
             bibs.extend([bib for bib in self.participants.keys() if bib not in bibs])
-            bibs.extend([format(bib, '04x').lower() for bib in self.unknowns.keys() if bib not in bibs])
+            bibs.extend([format(bib, '02x').lower() for bib in self.unknowns.keys() if bib not in bibs])
             names = [self.participants.get(bib, '') for bib in bibs]
             names = [name if name else self.unknowns.get(bib, '') for name, bib in zip(names, bibs)]
             dists.extend([1 for _ in range(len(names)- len(dists))])
@@ -149,7 +146,7 @@ class RaceTracker(BOTSORT):
                     det.track_id = bib_id
                     activated_stracks.append(det)
 
-        # Step 4: Update tracks
+        # Step 3: Update tracks based on matched pairs
         for itracked, idet in matches:
             track = strack_pool[itracked]
             det = detections[idet]
@@ -160,25 +157,31 @@ class RaceTracker(BOTSORT):
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
 
-        r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
-        for it in range(len(r_tracked_stracks)):
-            track = r_tracked_stracks[it]
+
+        # Step 4: Update state
+        # Promote to lost if not matched
+        unmatched_tracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
+        for it in range(len(unmatched_tracks)):
+            track = unmatched_tracks[it]
             if track.state != TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)
+        # Promote to removed if lost for too long
+        for track in self.lost_stracks:
+            if self.frame_id - track.end_frame > self.max_time_lost:
+                track.mark_removed()
+                removed_stracks.append(track)
 
-        # Step 5: Update state
+
 
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
         self.tracked_stracks = self.joint_stracks(self.tracked_stracks, activated_stracks)
         self.tracked_stracks = self.joint_stracks(self.tracked_stracks, refind_stracks)
         self.lost_stracks = self.sub_stracks(self.lost_stracks, self.tracked_stracks)
+        self.lost_stracks = self.sub_stracks(self.lost_stracks, self.removed_stracks)
         self.lost_stracks.extend(lost_stracks)
-        # self.lost_stracks = self.sub_stracks(self.lost_stracks, self.removed_stracks)
-        # self.tracked_stracks, self.lost_stracks = self.remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
-        # self.removed_stracks.extend(removed_stracks)
-        # if len(self.removed_stracks) > 1000:
-        #     self.removed_stracks = self.removed_stracks[-999:]  # clip remove stracks to 1000 maximum
+        self.removed_stracks = self.sub_stracks(self.removed_stracks, self.tracked_stracks)
+        self.removed_stracks.extend(removed_stracks)
 
         return np.asarray([x.result for x in self.tracked_stracks], dtype=np.float32)
 
@@ -223,3 +226,18 @@ class RaceTracker(BOTSORT):
         crops = crops.to(dtype=torch.half if self.half else torch.float, device=self.device)
 
         return crops
+
+    def get_dists(self, tracks, detections):
+        """Get distances between tracks and detections using IoU and (optionally) ReID embeddings."""
+        dists = matching.iou_distance(tracks, detections)
+        dists_mask = dists > self.proximity_thresh
+
+        # Just multiplies together detection confidence and IoU
+        dists = matching.fuse_score(dists, detections)
+
+        if self.args.with_reid and self.encoder is not None:
+            emb_dists = matching.embedding_distance(tracks, detections) / 2.0
+            emb_dists[emb_dists > self.appearance_thresh] = 1.0
+            emb_dists[dists_mask] = 1.0
+            dists = np.minimum(dists, emb_dists)
+        return dists
