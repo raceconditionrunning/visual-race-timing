@@ -298,20 +298,41 @@ class PartiallySupervisedTracker(BOTSORT):
         bboxes = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
         cls = results.cls
 
-            # (cv2) BGR 2 (PIL) RGB. The ReID models have been trained with this channel order
-            crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        remain_inds = scores > self.args.track_high_thresh
 
-            crop = torch.from_numpy(crop).float()
-            crops.append(crop)
+        dets = bboxes[remain_inds]
+        xyxys = xyxys[remain_inds]
 
-        # List of torch tensor crops to unified torch tensor
-        crops = torch.stack(crops, dim=0)
+        if self.feature_extractor and len(xyxys > 0):
+            crops = get_crops(xyxys, img)
+            features = self.feature_extractor(crops)
+            features = [x.cpu().numpy() for x in features]
+        else:
+            features = []
 
         # NOTE: BOTrack constructor's label for first arg is wrong. It's treated as xywh, not tlwh
         detections = [BOTrack(xywh, s, c, f) for (xywh, s, c, f) in zip(dets, scores, cls, features)]
 
-        crops = torch.permute(crops, (0, 3, 1, 2))
-        crops = crops.to(dtype=torch.half if self.half else torch.float, device=self.device)
+        # Step 1: First association, with high score detection boxes
+        strack_pool = self.joint_stracks(self.tracked_stracks, self.lost_stracks)
+        # Predict updates for tracked or recently-tracked objects
+        self.multi_predict(strack_pool)
+        # We'll consider all the tracks, but later we'll disqualify the removed ones from some matchings
+        strack_pool = self.joint_stracks(strack_pool, self.removed_stracks)
+        removed_track_i = [i for i, t in enumerate(strack_pool) if t.state == TrackState.Removed]
+        # Calculate track-to-detection cost matrix (lower cost => better match)
+        dists = self.get_dists(strack_pool, detections)
+        dists[removed_track_i, :] = np.inf
+        for known_id_i in range(len(box_ids)):
+            if box_ids[known_id_i] == -1:
+                continue
+            # If we have a track with this ID, force the match
+            for track_i, track in enumerate(strack_pool):
+                if track.track_id == box_ids[known_id_i]:
+                    dists[:, known_id_i] = np.inf
+                    dists[track_i, known_id_i] = 0
+                    break
+            # Note that if there's no track with a known ID, this annotation may still match and donate it's ID!
 
         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.args.match_thresh)
         emb_dists = matching.embedding_distance(strack_pool, detections)

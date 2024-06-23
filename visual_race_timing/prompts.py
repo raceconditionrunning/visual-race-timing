@@ -6,7 +6,7 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.validation import Validator, ValidationError
 
 
-def ask_for_id(choices, show_default=False, allow_other=False):
+def ask_for_id(choices, show_default=False, allow_other=False) -> str:
     prompt_text = "Bib: " if not allow_other else f"Bib/(U)nknown: "
     # Fallback for non-tty host
     if not sys.stdin.isatty():
