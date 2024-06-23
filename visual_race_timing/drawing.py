@@ -66,15 +66,18 @@ def draw_annotation(
             for i, d in enumerate(reversed(pred_boxes)):
                 # Flip the reversed index...
                 idx = len(pred_boxes) - i - 1
-                c, conf, id = int(d.cls), float(d.conf) if conf else None, None if d.id is None else int(d.id.item())
+                c, conf, id = int(d.cls), float(d.conf) if conf is not None else None, None if d.id is None else int(
+                    d.id.item())
                 is_crossing = crossings[idx] if crossings is not None else None
                 name = labels[idx] if labels else ""
-                color = colors[idx] if colors else (255, 0, 0)
+                color = colors[idx] if colors else (0, 0, 255)
+                txt_color = (0, 0, 0)
                 if is_crossing:
-                    color = (0, 255, 255)
-                label = (f"{name} {conf:.2f}" if conf else name) if labels else None
+                    color = (0, 0, 0)
+                    txt_color = (255, 255, 255)
+                label = (f"{name} {conf:.2f}" if conf else name)
                 box = d.xyxyxyxy.reshape(-1, 4, 2).squeeze() if is_obb else d.xyxy.squeeze()
-                annotator.box_label(box, label, color=color, rotated=is_obb)
+                annotator.box_label(box, label, color=color, txt_color=txt_color, rotated=is_obb)
 
         # Plot Pose results
         if keypoints is not None:
@@ -89,3 +92,7 @@ def render_timecode(timecode: Timecode, frame: np.ndarray):
     text_x = 10
     text_y = frame.shape[0] - 10
     cv2.putText(frame, timecode_str, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    # Draw frame number on the right corner
+    frame_number_str = f'{timecode.frames}'
+    text_x = frame.shape[1] - 100
+    cv2.putText(frame, frame_number_str, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
