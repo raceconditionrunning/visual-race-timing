@@ -1,7 +1,7 @@
 import pathlib
 import subprocess
 import json
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 from timecode import Timecode
 
@@ -46,3 +46,28 @@ def get_timecode(file_path: pathlib.Path) -> Optional[Timecode]:
                 fps = new_fps
 
     return Timecode(fps, timecode) if timecode and fps else None
+
+
+def crop_videos(sources: List[pathlib.Path], crop: Tuple[int, int, int, int]) -> List[pathlib.Path]:
+    processes = []
+    crop_arg = f'{crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}'
+    # Colons mess up basic resource parsing in ultralytics, so we'll dashes/underscores
+    crop_filename_str = f'{crop[0]}-{crop[1]}_{crop[2]}-{crop[3]}'
+    # We can only crop files
+    sources = sources if isinstance(sources, list) else [sources]
+    sources = [pathlib.Path(source) for source in sources]
+    crop_paths = []
+    # Start n shells to crop all sources
+    for source in sources:
+        # Store the cropped file in the same directory as the source
+        crop_path = pathlib.Path(source).parent / f'{pathlib.Path(source).stem}_crop_{crop_filename_str}.mp4'
+        crop_paths.append(crop_path)
+        if crop_path.exists():
+            continue
+        crop_cmd = f'ffmpeg -i {str(source)} -vf "crop={crop_arg}" -c:a copy {str(crop_path)}'
+        proc = subprocess.Popen(crop_cmd, shell=True)
+        processes.append(proc)
+
+    for proc in processes:
+        proc.wait()
+    return crop_paths
