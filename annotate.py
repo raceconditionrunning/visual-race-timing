@@ -64,8 +64,9 @@ def run(args):
             boxes = frame_annotations['boxes']
             kpts = frame_annotations['kpts']
             crossings = frame_annotations['crossings']
-            bibs = [format(box[4].astype(int), '02x') for box in boxes]
-            names = [race_config['participants'].get(bib.upper(), None) for bib in bibs]
+            ids = boxes[:, 4].astype(int)
+            bibs = [format(runner_id, '02x') for runner_id in ids]
+            names = [race_config['participants'].get(runner_id, None) for runner_id in ids]
             names = [name.split(" ")[0] if name else bib for bib, name in zip(bibs, names)]
             labels = [f"{bib}{' ' + name if name else ''}" for bib, name in zip(bibs, names)]
             frame = draw_annotation(img=frame, boxes=boxes, keypoints=kpts, crossings=crossings, labels=labels,
@@ -87,8 +88,9 @@ def run(args):
         emb_dist_ranking = np.argsort(emb_dists[:, 0])
         dists = list(emb_dists[emb_dist_ranking, 0])
         bibs = [format(candidate_participants[rank_i], '02x').lower() for rank_i in emb_dist_ranking]
-        bibs.extend([bib.lower() for bib in race_config["participants"].keys() if bib.lower() not in bibs])
-        names = [race_config["participants"].get(bib.upper(), '') for bib in bibs]
+        config_bibs = [format(runner_id, '02x').lower() for runner_id in race_config["participants"].keys()]
+        bibs.extend([bib for bib in config_bibs if bib not in bibs])
+        names = [race_config["participants"].get(int(bib, 16), '') for bib in bibs]
         dists.extend([1 for _ in range(len(names) - len(dists))])
         player.render()
         annotation_id_str = ask_for_id([(bib, (name, f"{dist:.2f}")) for bib, name, dist in zip(bibs, names, dists)],
@@ -124,11 +126,11 @@ def run(args):
             # Make a new note
             # Get runner id
             if runner_id is None:
-                bibs = [bib.lower() for bib in race_config["participants"].keys()]
-                names = [race_config["participants"].get(bib.upper(), None) for bib in bibs]
+                bib_name_pairs = [(format(runner_id, '02x').lower(), (name,)) for runner_id, name in
+                                  race_config["participants"].items()]
                 # Prompt the user to select an annotation to edit
                 if runner_id is None:
-                    runner_id = ask_for_id([(bib.lower(), (name,)) for bib, name in zip(bibs, names)])
+                    runner_id = ask_for_id(bib_name_pairs)
                     if runner_id is None:
                         return
             note = input("Enter note: ")
@@ -159,8 +161,9 @@ def run(args):
             modified = []
             annotation = annotations.get(frame_num, None)
             boxes = annotations[frame_num]['boxes']
-            bibs = [format(box[4].astype(int), '02x') for box in boxes]
-            names = [race_config["participants"].get(bib.upper(), None) for bib in bibs]
+            ids = boxes[:, 4].astype(int)
+            bibs = [format(runner_id, '02x') for runner_id in boxes]
+            names = [race_config["participants"].get(runner_id, None) for runner_id in ids]
             # Prompt the user to select an annotation to edit
             if runner_id is None:
                 runner_id = ask_for_id([(bib.lower(), (name,)) for bib, name in zip(bibs, names)])
