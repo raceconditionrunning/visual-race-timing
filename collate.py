@@ -29,9 +29,25 @@ def round_floats(o):
     return o
 
 
-def timecode_serialiser(obj):
+def timecode_serializer(obj):
     if isinstance(obj, Timecode):
         return str(obj)
+    return obj
+
+
+def snake_to_camel(s):
+    a = s.split('_')
+    a[0] = a[0].lower()
+    if len(a) > 1:
+        a[1:] = [u.title() for u in a[1:]]
+    return ''.join(a)
+
+
+def camelize(obj):
+    if isinstance(obj, dict):
+        return {snake_to_camel(k): camelize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [camelize(x) for x in obj]
     return obj
 
 
@@ -54,12 +70,13 @@ def main(args):
     for frame_num in frame_nums:
         boxes = annotations[frame_num]['boxes']
         crossings = annotations[frame_num]['crossings']
-        for id, is_crossing in zip(boxes[:, 4], crossings):
-            id = int(id)
+        for runner_id, is_crossing in zip(boxes[:, 4], crossings):
+            runner_id = int(runner_id)
             if is_crossing:
-                participant_lap_times[id].append(Timecode(fps, frames=frame_num))
+                participant_lap_times[runner_id].append(Timecode(fps, frames=frame_num))
                 crops[frame_num].append(
-                    (id, (len(participant_lap_times[id])), boxes[boxes[:, 4].astype(int) == id][0][:4]))
+                    (runner_id, (len(participant_lap_times[runner_id])),
+                     boxes[boxes[:, 4].astype(int) == runner_id][0][:4]))
 
     collated_notes = defaultdict(dict)
     for frame_num, notes_by_runner in notes.items():
@@ -67,11 +84,11 @@ def main(args):
             collated_notes[runner_id][frame_num] = note
 
     # Insert start time at start of lap time list depending on bib
-    for id in participant_lap_times.keys():
+    for runner_id in participant_lap_times.keys():
         for start_name, details in starts.items():
             bib_range = details['bibs']
-            if bib_range[0] <= id < bib_range[1]:
-                participant_lap_times[id] = [details['time']] + participant_lap_times[id]
+            if bib_range[0] <= runner_id < bib_range[1]:
+                participant_lap_times[runner_id] = [details['time']] + participant_lap_times[runner_id]
                 break
 
     if args.sources:
@@ -88,14 +105,12 @@ def main(args):
                 to_save = frame[crop[1]:crop[3], crop[0]:crop[2]]
                 cv2.imwrite(crop_out_path / f"{runner_id}_{crop_idx}_{frame_num}.png", to_save)
 
-    for id, lap_start_times in participant_lap_times.items():
-        runner_notes = collated_notes[format(id, '02x')]
-        note_frames = np.array(sorted(list(runner_notes.keys())))
-        id_str = format(id, '02x')
-        if id_str.upper() not in race_config['participants']:
+    for runner_id, lap_start_times in participant_lap_times.items():
+        runner_notes = collated_notes[format(runner_id, '02x')]
+        if runner_id not in race_config['participants']:
             continue
         # list has two extra entries: start time, and 1st lap entrance (which is not a full lap)
-        print(f"{race_config['participants'][id_str.upper()]} ({id_str}): {len(lap_start_times) - 2} laps")
+        print(f"{race_config['participants'][runner_id]} ({runner_id}): {len(lap_start_times) - 2} laps")
         lap_table = []
         lap_time = [lap_start_times[i].to_realtime(as_float=True) - lap_start_times[i - 1].to_realtime(
             as_float=True) if i > 0 else 0 for i in
@@ -108,7 +123,17 @@ def main(args):
         for i, lap_start_timecode in enumerate(lap_start_times):
             lap_table.append([i - 1 if i > 1 else "", str(lap_start_timecode), lap_start_timecode.frames, lap_time[i],
                               lap_time_change[i]])
-        # Interleave notes with lap times
+        # Which laps do the notes go before?
+        note_frames = sorted(list(runner_notes.keys()))
+        note_insertion_indices = np.searchsorted(np.array([entry[2] for entry in lap_table]), note_frames)
+        # Check laps which take 70-120% longer than the previous lap. Add a warning label, unless there's a note already there.
+        # We skip first (start time) and second (course entrance, not a full lap).
+        for i in range(3, len(lap_time)):
+            ratio = lap_time[i] / lap_time[i - 1]
+            if 2.2 >= ratio >= 1.7 and i not in note_insertion_indices:
+                runner_notes[lap_start_times[i].frames] = f"Warning: Lap time is {ratio:.2f}x the previous lap"
+
+        note_frames = sorted(list(runner_notes.keys()))
         for j, note_frame in enumerate(note_frames):
             note = runner_notes[note_frame]
             # We make a fresh copy each iteration because we're mutating
@@ -116,48 +141,37 @@ def main(args):
             lap_table.insert(note_idx,
                              [f"Note: {j}", str(Timecode(fps, frames=int(note_frame))), int(note_frame), None, None,
                               note])
+
         print(tabulate.tabulate(lap_table,
                                 headers=['Lap', 'Start Time', 'Start Frame', 'Lap Time', 'Lap Time Change', 'Notes'],
                                 floatfmt=".2f"))
 
     # count all laps
     all_laps = 0
-    for id, lap_times in participant_lap_times.items():
+    for runner_id, lap_times in participant_lap_times.items():
         all_laps += len(lap_times)
     print(f"Total laps: {all_laps}")
 
     output = {"config": race_config, "results": []}
 
-    for id, lap_times in participant_lap_times.items():
-        id_str = format(id, '02x')
-        if id_str.upper() not in race_config['participants']:
+    for runner_id, lap_times in participant_lap_times.items():
+        if runner_id not in race_config['participants']:
+            continue
+        if runner_id in race_config['exclude']:
             continue
         lap_diffs = [
             lap_times[i].to_realtime(as_float=True) - lap_times[i - 1].to_realtime(as_float=True) if i > 0 else 0 for i
             in range(1, len(lap_times))]
         output["results"].append({
-            'id': id,
-            'name': race_config['participants'][format(id, '02x').upper()],
+            'id': runner_id,
+            'name': race_config['participants'][runner_id],
             "lap_times": lap_diffs,
         })
     del output["config"]["participants"]
-
-    def snake_to_camel(s):
-        a = s.split('_')
-        a[0] = a[0].lower()
-        if len(a) > 1:
-            a[1:] = [u.title() for u in a[1:]]
-        return ''.join(a)
-
-    def camelize(obj):
-        if isinstance(obj, dict):
-            return {snake_to_camel(k): camelize(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return [camelize(x) for x in obj]
-        return obj
+    del output["config"]["exclude"]
 
     with open(args.project / "results.json", "w") as f:
-        json.dump(camelize(round_floats(output)), f, default=timecode_serialiser, indent=2)
+        json.dump(camelize(round_floats(output)), f, default=timecode_serializer, indent=2)
 
 
 def parse_args():
