@@ -19,7 +19,7 @@ from visual_race_timing.drawing import draw_annotation
 from visual_race_timing.geometry import line_segment_to_box_distance
 from visual_race_timing.prompts import ask_for_id
 from visual_race_timing.tracker import get_crops, PartiallySupervisedTracker
-from visual_race_timing.video_player import VideoPlayer
+from visual_race_timing.media_player import VideoPlayer, PhotoPlayer
 
 
 def run(args):
@@ -42,7 +42,10 @@ def run(args):
     with open(race_config, "r") as f:
         race_config = yaml.load(f.read(), Loader=yaml.FullLoader)
 
-    player = VideoPlayer(args.source, args.paused)
+    if len(args.source) == 1 and args.source[0].is_dir():
+        player = PhotoPlayer(args.source[0], args.paused)
+    else:
+        player = VideoPlayer(args.source, args.paused)
     if args.seek_frame:
         args.seek_time = str(Timecode(player.get_current_time().framerate, frames=args.seek_timecode_frame))
     if args.seek_time:
@@ -398,7 +401,7 @@ def parse_opt():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('project', type=pathlib.Path, default='data/exp')
-    parser.add_argument('--source', type=str, nargs='+', required=True,
+    parser.add_argument('--source', type=pathlib.Path, nargs='+', required=True,
                         help='file paths')
     parser.add_argument('--seek-frame', type=int,
                         help='seek frame (timecode index from start) to start tracking')
