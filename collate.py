@@ -12,8 +12,9 @@ from timecode import Timecode
 from tqdm import tqdm
 
 from visual_race_timing.annotations import load_annotations, load_notes
-from visual_race_timing.video_player import VideoPlayer
 import iteround
+
+from visual_race_timing.loader import ImageLoader, VideoLoader
 
 
 def round_floats(o):
@@ -53,7 +54,11 @@ def camelize(obj):
 
 def main(args):
     # Load race configuration from yaml
-    fps = '30000/1001'
+    if len(args.source) == 1 and args.source[0].is_dir():
+        loader = ImageLoader(args.source[0])
+    else:
+        loader = VideoLoader(args.source)
+    fps = loader.get_current_time().framerate
     race_config = args.project / 'config.yaml'
     with open(race_config, "r") as f:
         race_config = yaml.load(f.read(), Loader=yaml.FullLoader)
@@ -92,14 +97,13 @@ def main(args):
                 break
 
     if args.sources:
-        player = VideoPlayer(args.sources)
-        player.paused = True
         frames_needing_crop = sorted(list(crops.keys()))
         crop_out_path = args.project / 'crops'
         crop_out_path.mkdir(exist_ok=True)
         for frame_num in tqdm(frames_needing_crop):
-            player.seek_to_frame(frame_num)
-            frame = player._advance_frame()
+            loader.seek_frame(frame_num)
+            path, frame, metadata = loader.__next__()
+            frame = frame[0]
             for runner_id, crop_idx, crop in crops[frame_num]:
                 crop = [int(c) for c in crop]
                 to_save = frame[crop[1]:crop[3], crop[0]:crop[2]]

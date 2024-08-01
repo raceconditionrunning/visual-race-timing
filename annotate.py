@@ -49,7 +49,7 @@ def run(args):
     if args.seek_frame:
         args.seek_time = str(Timecode(player.get_current_time().framerate, frames=args.seek_timecode_frame))
     if args.seek_time:
-        player.seek_to_time(args.seek_time)
+        player.seek_time(args.seek_time)
 
     def overlay_annotations(frame, frame_num):
         frame_annotations = annotations.get(frame_num, None)
@@ -237,7 +237,7 @@ def run(args):
 
             if next_frame:
                 print(f"Seeking to {player.get_current_time()} ({player.get_current_time().frames})")
-                player.seek_to_time(str(Timecode(player.get_current_time().framerate, frames=next_frame)))
+                player.seek_time(str(Timecode(player.get_current_time().framerate, frames=next_frame)))
                 player._advance_frame()
                 player.render()
             else:
@@ -251,8 +251,9 @@ def run(args):
                                              x["boxes"][:, :4]) < 10))
 
             if next_frame:
-                player.seek_to_time(str(Timecode(player.get_current_time().framerate,
-                                                 frames=next_frame)))
+                next_timecode = Timecode(player.get_current_time().framerate,
+                                         frames=next_frame)
+                player.seek_timecode(next_timecode)
                 player._advance_frame()
                 player.render()
                 print(f"Found a runner on the line at {player.get_current_time()} ({player.get_current_time().frames})")
@@ -317,7 +318,7 @@ def run(args):
                                         replace=True)
                     player.render()
                     if i != 0:
-                        player.seek_to_time(str(Timecode(player.get_current_time().framerate,
+                        player.seek_time(str(Timecode(player.get_current_time().framerate,
                                                          frames=start_frame + i)))
                         player._advance_frame()
                         player.render()

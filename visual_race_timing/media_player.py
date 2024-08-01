@@ -5,14 +5,7 @@ import cv2
 from timecode import Timecode
 
 from visual_race_timing.drawing import render_timecode
-from visual_race_timing.video import get_timecode
-
-import os
-import pathlib
-from sortedcontainers import SortedDict
-from tqdm import tqdm
-import exif
-import datetime
+from visual_race_timing.loader import ImageLoader, VideoLoader
 
 
 class MediaPlayer:
@@ -39,11 +32,11 @@ class MediaPlayer:
     def get_current_time(self):
         raise NotImplementedError("get_current_time must be implemented by subclass")
 
-    def seek_to_timecode(self, timecode: Timecode) -> bool:
-        raise NotImplementedError("seek_to_timecode must be implemented by subclass")
+    def seek_timecode(self, timecode: Timecode) -> bool:
+        raise NotImplementedError("seek_timecode must be implemented by subclass")
 
-    def seek_to_time(self, time_str: str) -> bool:
-        raise NotImplementedError("seek_to_time must be implemented by subclass")
+    def seek_time(self, time_str: str) -> bool:
+        raise NotImplementedError("seek_time must be implemented by subclass")
 
     def play(self):
         raise NotImplementedError("play must be implemented by subclass")
@@ -124,9 +117,9 @@ class MediaPlayer:
         elif key == ord('s'):  # Seek to time
             timecode = input("Enter time to seek to (HH:MM:SS): ")
             try:
-                self.seek_to_time(timecode)
+                self.seek_time(timecode)
                 self.render()
-            except Exception:
+            except Exception as e:
                 print("Invalid time format. Please enter time in HH:MM:SS format.")
                 return
         elif key == ord('+'):  # Increase playback speed
@@ -140,25 +133,15 @@ class MediaPlayer:
 class VideoPlayer(MediaPlayer):
     def __init__(self, sources, paused=False):
         super().__init__(paused)
-        self.cap = cv2.VideoCapture(sources[0])
-        self._start_timecodes = [get_timecode(source) for source in sources]
-        self._end_timecodes = [tc + int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) for tc in self._start_timecodes]
-        self._sources = sources
-        self._idx = 0
+        self.loader = VideoLoader(sources)
 
-    @property
-    def source(self):
-        return self._sources[self._idx]
-
-    def seek_to_time(self, time_str: str) -> bool:
+    def seek_time(self, time_str: str) -> bool:
         # Check if includes frame number (HH:MM:SS:FF), if not add :00
         if len(time_str.split(':')) == 3 and ";" not in time_str:
             time_str += ':00'
-        return self.seek_to_timecode(Timecode(self._start_timecodes[0].framerate, time_str))
+        return self.loader.seek_time(time_str)
 
-    def seek_to_timecode(self, timecode: Timecode) -> bool:
-        # We roll one back because we have to increment to retrieve the frame
-        timecode = timecode - 1
+    def seek_timecode(self, timecode: Timecode) -> bool:
         if self.get_current_time() == timecode:
             return True
         if timecode > self.get_current_time():
@@ -169,58 +152,30 @@ class VideoPlayer(MediaPlayer):
                     self._advance_frame()
                     frame_diff -= 1
                 return True
-        # scan from latest to earliest timecodes looking for the right source
-        check_idx = len(self._start_timecodes) - 1
-        while check_idx > 0 and timecode < self._start_timecodes[check_idx]:
-            check_idx -= 1
-        if check_idx == -1:
-            print("Timecode is before the first source")
-            return False
-        elif check_idx != self._idx:
-            self.cap.release()
-            self.cap = cv2.VideoCapture(self._sources[check_idx])
-        self._idx = check_idx
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, timecode.frames - self._start_timecodes[self._idx].frames)
-        return self.get_current_time() == timecode
 
-    def seek_to_frame(self, frame_number: int) -> bool:
-        return self.seek_to_timecode(Timecode(self._start_timecodes[0].framerate, frames=frame_number))
+        return self.loader.seek_timecode(timecode)
+
+    def seek_frame(self, frame_number: int) -> bool:
+        return self.loader.seek_frame(frame_number)
 
     def get_current_time(self) -> Timecode:
-        return self._start_timecodes[self._idx] + int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-
-    def _next_source(self):
-        self.cap.release()
-        self._idx += 1
-        if self._idx >= len(self._sources):
-            return False
-        self.cap = cv2.VideoCapture(self.source)
-        return True
+        return self.loader.get_current_time()
 
     def _advance_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            next_available = self._next_source()
-            if not next_available:
-                return None
-            ret, frame = self.cap.read()
-            if not ret:
-                return None
-        self.current_frame_img = frame
-        return frame
+        path, frame, metadata = self.loader.__next__()
+        self.current_timecode = metadata[0][0]
+        self.current_frame_img = frame[0]
+        return frame[0]
 
     def play(self):
-        if not self.cap.isOpened():
-            print("Error: Could not open video.")
-            return
         # NORMAL disables right click context menu
         cv2.namedWindow(self.window_name, cv2.WINDOW_GUI_NORMAL)
         cv2.setMouseCallback(self.window_name, self.mouse_callback)
 
-        while self.cap.isOpened():
+        while True:
             if self.needs_advance:
                 if self.needs_advance < 0:
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.cap.get(cv2.CAP_PROP_POS_FRAMES) - 2)
+                    self.loader.seek_frame(self.get_current_time().frames - 2)
 
                 frame = self._advance_frame()
                 if frame is None:
@@ -233,7 +188,6 @@ class VideoPlayer(MediaPlayer):
             if result == -1:
                 break
 
-        self.cap.release()
         cv2.destroyAllWindows()
 
 
@@ -260,78 +214,30 @@ class DisplayWindow(threading.Thread):
         cv2.destroyAllWindows()
 
 
-def get_capture_times_from_exif(jpg_directory: pathlib.Path) -> SortedDict:
-    frame_times = SortedDict()
-    # Iterate through the .jpg files in the directory
-    for image_path in tqdm(jpg_directory.glob("*.jpg")):
-        image_path = image_path.resolve()
-        try:
-            # Open the image
-            with open(image_path, 'rb') as image_file:
-                image = exif.Image(image_file)
-
-            capture_time = datetime.datetime.strptime(image["datetime_original"] + ":" + image["subsec_time_original"],
-                                                      "%Y:%m:%d %H:%M:%S:%f")
-            frame_times[image_path] = capture_time
-        except (OSError, KeyError, AttributeError) as e:
-            # Handle any exceptions while processing the image
-            print(f"Error processing image: {image_path}")
-            print(e)
-    return frame_times
-
-
-def load_timecode_index(timecode_index: pathlib.Path):
-    files = os.listdir(timecode_index)
-    time_frame_paths = SortedDict()
-    for file in files:
-        # Remove extension
-        date_part = ".".join(file.split(".")[:-1])
-        time = datetime.datetime.strptime(date_part, "%Y-%m-%d_%H:%M:%S.%f")
-        time_frame_paths[time] = (timecode_index / file).resolve()
-    return time_frame_paths
-
-
-def create_timecode_symlinks(frames_by_time: SortedDict, out_dir: pathlib.Path):
-    # Make the capture time the filename
-    time_frame_paths = SortedDict()
-    for i, (frame_path, capture_time) in tqdm(enumerate(frames_by_time.items())):
-        link_path = out_dir / capture_time.strftime('%Y-%m-%d_%H:%M:%S.%f')
-        os.system(f"ln -s {frame_path} {link_path}")
-        time_frame_paths[capture_time] = link_path
-    return time_frame_paths
-
-
 class PhotoPlayer(MediaPlayer):
     def __init__(self, frame_directory, paused=False):
-        frame_directory = frame_directory.resolve()
+        self.loader = ImageLoader(frame_directory)
         super().__init__(paused)
-        if (frame_directory / "timecode_index").is_dir():
-            self.time_to_path = load_timecode_index(frame_directory / "timecode_index")
-        else:
-            frame_times = get_capture_times_from_exif(frame_directory)
-            (frame_directory / "timecode_index").mkdir()
-            self.time_to_path = create_timecode_symlinks(frame_times, (frame_directory / "timecode_index"))
-            # Get seconds from start of day
-            first_frame_date = list(self.time_to_path.keys())[0]
-            first_frame_time = first_frame_date - datetime.datetime(first_frame_date.year, first_frame_date.month,
-                                                                    first_frame_date.day)
-            self.start_timecode = Timecode(60, start_seconds=first_frame_time.total_seconds())
         self.index = 0
+        self.current_frame_timecode = None
+
+    def seek_time(self, time_str: str) -> bool:
+        # Check if includes frame number (HH:MM:SS:FF), if not add :00
+        if len(time_str.split(':')) == 3 and ";" not in time_str:
+            time_str += ':00'
+        return self.seek_timecode(Timecode(1000, start_timecode=time_str))
+
+    def seek_timecode(self, timecode: Timecode) -> bool:
+        return self.loader.seek_timecode(timecode)
 
     def get_current_time(self):
-        frame_date = list(self.time_to_path.keys())[self.index]
-        frame_time = frame_date - datetime.datetime(frame_date.year, frame_date.month,
-                                                    frame_date.day)
-        return Timecode(60, start_seconds=frame_time.total_seconds())
+        return self.current_frame_timecode
 
     def _advance_frame(self):
-        if self.index >= len(self.time_to_path):
-            return None
-        frame_path = list(self.time_to_path.values())[self.index]
-        frame = cv2.imread(str(frame_path))
-        self.index += 1
-        self.current_frame_img = frame
-        return frame
+        path, frame, metadata = self.loader.__next__()
+        self.current_frame_img = frame[0]
+        self.current_frame_timecode = metadata[0][0]
+        return frame[0]
 
     def play(self):
         # NORMAL disables right click context menu

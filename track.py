@@ -121,7 +121,7 @@ def run(args):
     if args.seek_frame:
         args.seek_time = str(Timecode(player.get_current_time().framerate, frames=args.seek_timecode_frame))
     if args.seek_time:
-        player.seek_to_time(args.seek_time)
+        player.seek_time(args.seek_time)
 
     runners = {}
     finish_line_p0 = race_config['finish_line'][0]
@@ -143,7 +143,7 @@ def run(args):
     track_boxes = load_annotations(args.project / 'tracks')
 
     for frame_num, detections in detection_boxes.items():
-        player.seek_to_frame(frame_num)
+        player.seek_frame(frame_num)
         frame = player._advance_frame()
 
         boxes = Boxes(detections["boxes"], frame.shape[:2])
