@@ -23,9 +23,14 @@ from visual_race_timing.media_player import VideoPlayer, PhotoPlayer
 
 
 def run(args):
+    if len(args.source) == 1 and args.source[0].is_dir():
+        player = PhotoPlayer(args.source[0], args.paused)
+    else:
+        player = VideoPlayer(args.source, args.paused)
+
     # Load all annotations
-    annotations = load_annotations(args.project / 'annotations')
-    candidate_boxes = load_annotations(args.project / 'detections')
+    annotations = load_annotations(args.project / 'annotations', player.loader.get_image_size())
+    candidate_boxes = load_annotations(args.project / 'detections', player.loader.get_image_size())
     notes = load_notes(args.project / 'notes.tsv')
 
     # crossing_map = build_crossing_map(annotations)
@@ -42,10 +47,6 @@ def run(args):
     with open(race_config, "r") as f:
         race_config = yaml.load(f.read(), Loader=yaml.FullLoader)
 
-    if len(args.source) == 1 and args.source[0].is_dir():
-        player = PhotoPlayer(args.source[0], args.paused)
-    else:
-        player = VideoPlayer(args.source, args.paused)
     if args.seek_frame:
         args.seek_time = str(Timecode(player.get_current_time().framerate, frames=args.seek_timecode_frame))
     if args.seek_time:
@@ -62,7 +63,8 @@ def run(args):
             crossings = frame_boxes['crossings']
             frame = draw_annotation(img=frame, boxes=boxes, keypoints=kpts, crossings=crossings, labels=None,
                                     conf=boxes[:, 4],
-                                    kpt_radius=2, colors=[(0, 255, 0)] * len(boxes), line_width=1)
+                                    kpt_radius=2 * frame.shape[0] // 1080, colors=[(0, 255, 0)] * len(boxes),
+                                    line_width=1 * frame.shape[0] // 1080)
         if frame_annotations is not None:
             boxes = frame_annotations['boxes']
             kpts = frame_annotations['kpts']
@@ -73,11 +75,12 @@ def run(args):
             names = [name.split(" ")[0] if name else bib for bib, name in zip(bibs, names)]
             labels = [f"{bib}{' ' + name if name else ''}" for bib, name in zip(bibs, names)]
             frame = draw_annotation(img=frame, boxes=boxes, keypoints=kpts, crossings=crossings, labels=labels,
-                                    kpt_radius=2, line_width=1)
+                                    kpt_radius=2 * frame.shape[0] // 1080, line_width=1 * frame.shape[0] // 1080)
         if frame_notes is not None:
             for i, (runner_id, note) in enumerate(frame_notes.items()):
-                frame = cv2.putText(frame, f"{runner_id}: {note}", (10 + 10 * i, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                    (255, 255, 255), 1,
+                frame = cv2.putText(frame, f"{runner_id}: {note}", (10 + 10 * i, 10 * frame.shape[0] // 1080),
+                                    cv2.FONT_HERSHEY_SIMPLEX, .5 * frame.shape[0] // 1080,
+                                    (255, 255, 255), 1 * frame.shape[0] // 1080,
                                     cv2.LINE_AA)
         return frame
 

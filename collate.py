@@ -67,7 +67,7 @@ def main(args):
     for start_name, details in starts.items():
         starts[start_name]['time'] = Timecode(fps, details['time'])
 
-    annotations = load_annotations(args.project / "annotations")
+    annotations = load_annotations(args.project / "annotations", loader.get_image_size())
     notes = load_notes(args.project / "notes.tsv")
     frame_nums = sorted(list(annotations.keys()))
     participant_lap_times = defaultdict(list)

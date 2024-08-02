@@ -66,14 +66,14 @@ def load_txt_annotation(txt_file: pathlib.Path, img_size=(1920, 1080)):
     return np.array(boxes), np.array(kpts) if kpts else None, np.array(crossings)
 
 
-def load_annotations(annotations_path: pathlib.Path) -> SortedDict[int, Dict[str, any]]:
+def load_annotations(annotations_path: pathlib.Path, img_size: Tuple[int, int]) -> SortedDict[int, Dict[str, any]]:
     annotations = SortedDict()
     if not annotations_path.exists():
         return annotations
     for txt_file in tqdm(annotations_path.glob("frame_*.txt")):
         # Extract frame number from the txt file name ("frame_NUMBER.txt")
         frame = int(txt_file.stem.split('_')[-1])
-        boxes, kpts, crossings = load_txt_annotation(txt_file)
+        boxes, kpts, crossings = load_txt_annotation(txt_file, img_size)
         boxes, kpts, crossings = remove_duplicates(boxes, kpts, crossings)
         annotations[frame] = {'boxes': boxes, 'kpts': kpts, 'crossings': crossings}
     return annotations
@@ -300,7 +300,10 @@ def remove_duplicates(boxes: Boxes, kpts: Keypoints, crossings):
     return boxes, kpts, crossings
 
 
-def offset_with_crop(boxes: Boxes, kpts: Keypoints, crop: List[int], uncropped_size: Tuple[int, int]):
+def offset_with_crop(boxes: Boxes, kpts: Keypoints, crop: List[int], uncropped_shape: Tuple[int, int]):
+    """
+    uncropped_shape: (w, h)
+    """
     # Offset the boxes and keypoints by the crop
     new_boxes = boxes.cpu().numpy().data
     new_kpts = kpts.cpu().numpy().data if kpts is not None else None
@@ -308,7 +311,7 @@ def offset_with_crop(boxes: Boxes, kpts: Keypoints, crop: List[int], uncropped_s
     # Crop is [w, h, x, y]
     new_boxes[:, [0, 2]] += crop[2]
     new_boxes[:, [1, 3]] += crop[3]
-    new_boxes = Boxes(new_boxes, uncropped_size)
+    new_boxes = Boxes(new_boxes, uncropped_shape)
 
     # Offset the keypoints
     if new_kpts is not None:
@@ -316,5 +319,5 @@ def offset_with_crop(boxes: Boxes, kpts: Keypoints, crop: List[int], uncropped_s
         for i in range(len(new_kpts)):
             new_kpts[i][:, 0] += crop[2]
             new_kpts[i][:, 1] += crop[3]
-        new_kpts = Keypoints(new_kpts, uncropped_size)
+        new_kpts = Keypoints(new_kpts, uncropped_shape)
     return new_boxes, new_kpts

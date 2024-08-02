@@ -91,8 +91,15 @@ def render_timecode(timecode: Timecode, frame: np.ndarray):
     timecode_str = f'{timecode}'
     text_x = 10
     text_y = frame.shape[0] - 10
-    cv2.putText(frame, timecode_str, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    # Font should be 1/20 of the frame height
+    font_scale = frame.shape[0] / 2000
+    thickness = int(font_scale * 2)
+    cv2.putText(frame, timecode_str, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness * 4)
+    cv2.putText(frame, timecode_str, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
     # Draw frame number on the right corner
     frame_number_str = f'{timecode.frames}'
-    text_x = frame.shape[1] - 100
-    cv2.putText(frame, frame_number_str, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    text_x = int(frame.shape[1] - 100 * font_scale * 2)
+    cv2.putText(frame, frame_number_str, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0),
+                thickness * 4)
+    cv2.putText(frame, frame_number_str, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255),
+                thickness)
