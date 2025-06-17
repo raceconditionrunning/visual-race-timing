@@ -12,7 +12,7 @@ import yaml
 
 from ultralytics import YOLO
 
-from visual_race_timing.annotations import save_txt_annotation, offset_with_crop
+from visual_race_timing.annotations import SQLiteAnnotationStore, offset_with_crop
 from visual_race_timing.drawing import render_timecode, draw_annotation
 
 from visual_race_timing.geometry import line_segment_to_box_distance
@@ -46,15 +46,10 @@ def run(args):
     else:
         loader = VideoLoader(args.source, batch=args.batch, vid_stride=args.vid_stride, crop=args.crop)
 
-    frame_dir = Path(f"{args.project}/{args.name}")
+    store = SQLiteAnnotationStore(Path(f"{args.project}/{args.name}/annotations.db"))
     if args.continue_exp:
         # Look in the save directory for the last frame
-        last_frame = 0
-
-        for frame_file in (frame_dir / "detections").glob('frame_*.txt'):
-            frame_num = int(frame_file.stem.split('_')[-1])
-            if frame_num > last_frame:
-                last_frame = frame_num
+        last_frame = store.get_last_frame(args.yolo_model.stem)
         if last_frame != 0:
             args.seek_timecode_frame = last_frame
 
@@ -104,7 +99,6 @@ def run(args):
 
             start_timecode = m[0]
             timecode_frame = start_timecode.frames
-            frame_result_path = frame_dir / f'detections/frame_{timecode_frame}.txt'
             boxes, keypoints = r.boxes[on_line_mask], None
             if len(boxes) == 0:
                 continue
@@ -120,7 +114,8 @@ def run(args):
                 display_window.img_queue.put(img, block=False)
             if args.crop:
                 boxes, keypoints = offset_with_crop(boxes, keypoints, args.crop, loader._source_dims[0])
-            save_txt_annotation(boxes, keypoints, crossings, Path(frame_result_path), replace=True)
+            store.save_annotation(timecode_frame, boxes, keypoints, crossings, source=args.yolo_model.stem,
+                                  replace=True)
 
 
 def parse_opt():

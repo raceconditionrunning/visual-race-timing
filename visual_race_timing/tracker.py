@@ -259,6 +259,15 @@ class RaceTracker(BOTSORT):
         return dists
 
 
+def custom_track_str(track):
+    # We need this to be a function so we can easily pickle the tracker
+    return f"OT_{format(track.track_id, '02X')}_({track.start_frame}-{track.end_frame})"
+
+
+def noop(*args, **kwargs):
+    # We need this to be a function so we can easily pickle the tracker
+    return None
+
 class PartiallySupervisedTracker(BOTSORT):
     def __init__(
             self,
@@ -270,13 +279,13 @@ class PartiallySupervisedTracker(BOTSORT):
         super().__init__(args, frame_rate)
         self.half = False
         self.device = device
-        self.display_delegate = lambda x: None
+        self.display_delegate = noop
         if args.with_reid:
             self.feature_extractor = torchreid.utils.FeatureExtractor(model_name='osnet_ain_x1_0',
                                                                       model_path=model_weights,
                                                                       device=self.device)
         # HACK: Monkey patch so we get hex print outs to match bibs
-        BOTrack.__str__ = lambda self: f"OT_{format(self.track_id, '02x')}_({self.start_frame}-{self.end_frame})"
+        BOTrack.__str__ = custom_track_str
         # cv2.namedWindow("Decision")
 
     def update(self, results, img=None):
@@ -421,6 +430,7 @@ class PartiallySupervisedTracker(BOTSORT):
 
     def update_participant_features(self, frame, box, track_id: int):
         # One box at a time!
+        box = np.atleast_2d(box)
         crops = get_crops(box[:, :4], frame)
         query_features = self.feature_extractor(crops).cpu().numpy()[0]
         strack_pool = self.joint_stracks(self.tracked_stracks, self.lost_stracks)

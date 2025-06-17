@@ -1,5 +1,6 @@
 exif
 ffmpeg-python
+filterpy
 gdown
 iteround
 joblib
@@ -8,11 +9,11 @@ numpy
 prompt_toolkit
 pyyaml
 sortedcontainers
+tabulate
 tensorboard
 timecode
 torch==2.2.0
-torchvision==0.17.0
-ultralytics==8.2.0
-filterpy
 torchreid
+torchvision==0.17.0
 tqdm
+ultralytics==8.2.0

@@ -3,9 +3,15 @@ import subprocess
 import json
 from typing import Optional, Tuple, List
 
+from joblib import Memory
 from timecode import Timecode
 
+# Create joblib memory cache
+CACHE_DIR = ".cache"
+memory = Memory(str(CACHE_DIR), verbose=0)
 
+
+@memory.cache
 def get_video_metadata(video_path: pathlib.Path) -> dict:
     # Run ffprobe to get the metadata
     result = subprocess.run(
@@ -30,6 +36,7 @@ def get_video_height_width(video_path: pathlib.Path) -> Optional[Tuple[int, int]
     return None
 
 
+@memory.cache
 def get_timecode(file_path: pathlib.Path) -> Optional[Timecode]:
     metadata = get_video_metadata(file_path)
     timecode = None

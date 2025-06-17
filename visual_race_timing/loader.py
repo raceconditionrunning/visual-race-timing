@@ -13,6 +13,10 @@ from tqdm import tqdm
 
 from visual_race_timing.video import get_timecode, get_video_height_width
 
+from visual_race_timing.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 class Loader:
     def __init__(self, paths, batch=1, crop=None):
@@ -143,21 +147,35 @@ class VideoLoader(Loader):
         self._source_dims = [get_video_height_width(source) for source in paths]
         assert all(
             [dim == self._source_dims[0] for dim in self._source_dims]), "All videos must have the same dimensions"
+        assert all([timecode.framerate == self._timecodes[0].framerate for timecode in self._timecodes]), \
+            "All videos must have the same framerate"
+        self.fps = self._timecodes[0].framerate  # Framerate of the first video
         self._frame_lengths = [int(cv2.VideoCapture(source).get(cv2.CAP_PROP_FRAME_COUNT)) for source in paths]
         end_timecodes = [timecode + frame_length for timecode, frame_length in
                          zip(self._timecodes, self._frame_lengths)]
-        for i in range(1, len(end_timecodes)):
-            assert end_timecodes[i - 1] < self._timecodes[i], "Videos must not have overlapping timecode"
+        # Calculate gap between videos (if any)
+        self.gaps = []
+        for i in range(len(end_timecodes) - 1):
+            gap = self._timecodes[i + 1].frame_number - end_timecodes[i].frame_number
+            self.gaps.append(gap)
 
         self.num_sources = len(paths)
         self.vid_stride = vid_stride  # video frame-rate stride
 
         self._new_video(self.files[0])  # new video
+        # Index across all sources. The next frame grabbed will have this index.
         self._current_frame = 0
+        # Index into the current video source. The next frame grabbed will have this index.
         self._source_frame = 0
+        # How many gap frames we have already skipped in the current source
+        self.gap_offset = 0
+        self.frames_to_stride = self.bs
 
     def __next__(self):
         """Returns the next batch of images along with their paths and metadata."""
+        logger.debug(
+            f"User wants next frame. Expected next frame: {self._current_frame} ({self._timecodes[0] + self._current_frame}) "
+            f"source_index: {self.source_index},  source_frame: {self._source_frame}, gap_offset: {self.gap_offset}, frames_to_stride: {self.frames_to_stride}")
         paths, imgs, info = [], [], []
         while len(imgs) < self.bs:
             if self.source_index >= self.num_sources:  # end of file list
@@ -171,46 +189,86 @@ class VideoLoader(Loader):
             if not self.cap or not self.cap.isOpened():
                 self._new_video(path)
 
-            success = True
-            for _ in range(self.vid_stride - 1):  # FIXME: Messes with seeks
-                success = self.cap.grab()
-                if not success:
-                    break  # end of video or failure
+            try:
+                # source_frame is synced with the capture, so it is the frame that will be retrieved next.
+                start_frame = self._timecodes[self.source_index].frames - self._timecodes[
+                    0].frames + self._source_frame + self.gap_offset
+                # This was updated the last time we retrieved a frame. Our goal is to seek so that we can call retrieve and grab this frame.
+                next_frame = self._current_frame
+                # Check which source the next frame belongs to. Bisect right to fall to the next source (right) if the frame matches the start timecode
+                next_frame_source = bisect.bisect_right(self._timecodes, self._timecodes[0].frames + next_frame) - 1
+                if next_frame_source != self.source_index:
+                    raise (RuntimeError(
+                        f"Reached end of video {path} at frame {self._source_frame + self.gap_offset}."))
+                end_of_source_frame = (self._timecodes[next_frame_source] + self._frame_lengths[next_frame_source] -
+                                       self._timecodes[0]).frames
+                start_of_next_source_frame = self._timecodes[next_frame_source + 1].frames - self._timecodes[
+                    0].frames if next_frame_source + 1 < self.num_sources else float('inf')
+                # Current frame is the true index which tells us if we are in a gap or not. If we go forward, what's our new offset?
+                if end_of_source_frame <= next_frame < start_of_next_source_frame:
+                    # For gap frames, we need to manually set the position to the last frame of the current source
+                    if self._source_frame != self._frame_lengths[self.source_index]:
+                        # A seek operation may have already set up the source target correctly, check and move if not
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self._frame_lengths[next_frame_source])
+                else:
+                    # We need to grab atleast one frame to get the next frame
+                    for _ in range(next_frame - start_frame + 1):
+                        success = self.cap.grab()
+                        if not success:
+                            raise RuntimeError(f"Failed to grab frame {next_frame}")
 
-            if success:
-                frame_length = self._frame_lengths[self.source_index]
-                self._source_frame = int(cv2.VideoCapture.get(self.cap, cv2.CAP_PROP_POS_FRAMES))
+                self._source_frame = int(cv2.VideoCapture.get(self.cap,
+                                                              cv2.CAP_PROP_POS_FRAMES))  # NOTE: Doesn't increment past the last frame of the video, so we need to increment it manually
+
                 success, im0 = self.cap.retrieve()
                 if success:
-                    frame_timecode = self._timecodes[self.source_index] + self._source_frame
+                    frame_timecode = Timecode(self.get_fps(), frames=self._timecodes[0].frames) + self._current_frame
                     paths.append(path)
+                    # NOTE: Because the cap won't increment past the last frame of the video, the source_frame counter won't increment when retrieving the last frame.
+                    # when that happens, this calculated value will be off by one.
+                    # alt_frame_timecode = self._timecodes[self.source_index] + self._source_frame - 1 + self.gap_offset
                     if self.crop:
                         # given in ffmpeg format: width:height:x:y
                         im0 = im0[self.crop[3]:self.crop[3] + self.crop[1], self.crop[2]:self.crop[2] + self.crop[0]]
                     imgs.append(im0)
-                    info.append([frame_timecode,
+                    frame_length = self._frame_lengths[self.source_index]
+                    info.append([frame_timecode, self._current_frame,
                                  f"video {self.source_index + 1}/{self.num_sources} (frame {self._source_frame}/{frame_length}) {path}: "])
-                    if self._source_frame == frame_length:  # end of video
-                        self.source_index += 1
-                        self.cap.release()
-            else:
+                    # Note that source frame is for the _next_ frame
+                    self._current_frame = next_frame + self.frames_to_stride
+                    if end_of_source_frame <= self._current_frame < start_of_next_source_frame:
+                        self.gap_offset = start_of_next_source_frame - self._current_frame
+                else:
+                    raise RuntimeError(f"Failed to retrieve frame from {path} at frame {self._source_frame}.")
+            except RuntimeError:
                 # Move to the next file if the current video ended or failed to open
                 self.source_index += 1
+                self.gap_offset = 0
                 if self.cap:
                     self.cap.release()
                 if self.source_index < self.num_sources:
                     self._new_video(self.files[self.source_index])
-                    self._current_frame = sum(self._frame_lengths[:self.source_index])
 
+        logger.debug(
+            f"Completed batch. Expected next frame: {self._current_frame} ({self._timecodes[0] + self._current_frame}) "
+            f"source_index: {self.source_index},  source_frame: {self._source_frame}, gap_offset: {self.gap_offset}, frames_to_stride: {self.frames_to_stride}")
         return paths, imgs, info
 
     def get_image_dims(self):
         return self._source_dims[0]
 
+    def get_fps(self) -> str:
+        return self.fps
+
     def get_current_time(self) -> Timecode:
-        return self._timecodes[self.source_index] + self._source_frame
+        """ Returns the timecode that would be returned by the next call to __next__. Includes real frames and gaps."""
+        # Note that this requires gaps to have been accounted for in the current frame calculation
+        return self._timecodes[0] + self.get_current_frame()
 
     def get_current_frame(self) -> int:
+        """
+        Returns the index of the frame that would be returned by the next call to __next__. This counter increments and includes real frames and gaps.
+        """
         return self._current_frame
 
     def seek_time(self, time_str: str) -> bool:
@@ -221,7 +279,7 @@ class VideoLoader(Loader):
         """Creates a new video capture object for the given path."""
         self._source_frame = 0
         self.cap = cv2.VideoCapture(path)
-        self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
+        self.gap_offset = 0
         if not self.cap.isOpened():
             raise FileNotFoundError(f"Failed to open video {path}")
 
@@ -229,38 +287,69 @@ class VideoLoader(Loader):
         """
         Look for the nth frame of all sources combined.
         """
-        start_source_index = self.source_index
-        self.source_index = 0
-        # Skip sources if we ask for a frame index way out ahead
-        while target_frame > self._frame_lengths[self.source_index]:
-            target_frame -= self._frame_lengths[self.source_index]
-            self.source_index += 1
-        if self.source_index != start_source_index:
-            self._new_video(self.files[self.source_index])
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-        return int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) == target_frame
+        logger.debug(f"Seeking to frame {target_frame} ({self._timecodes[0] + target_frame}) across all sources.")
+        return self.seek_timecode(self._timecodes[0] + target_frame)
 
     def seek_timecode(self, target_timecode):
-        if target_timecode < self._timecodes[0] or target_timecode > self._timecodes[-1]:
+        """Seek to a specific timecode across all sources."""
+        if target_timecode < self._timecodes[0] or target_timecode > self._timecodes[-1] + self._frame_lengths[-1]:
             return False
-        start_source_index = self.source_index
-        self.source_index = 0
-        while target_timecode > (self._timecodes[self.source_index] + self._frame_lengths[self.source_index]):
-            self.source_index += 1
-        if self.source_index != start_source_index:
+
+        if target_timecode == self._timecodes[0] + self._current_frame:
+            # If we are already at the target timecode, no need to seek
+            return True
+        # Forward seek optimization
+        if target_timecode > self._timecodes[0] + self._current_frame:
+            frame_diff = (target_timecode - self._timecodes[0]).frames - self._current_frame
+            if 2 <= frame_diff < 5:
+                while frame_diff > 1:
+                    self.__next__()
+                    frame_diff -= 1
+                return True
+
+        # Find the source containing this timecode
+        source_index = bisect.bisect_right(self._timecodes, target_timecode) - 1
+
+        if source_index is None:
+            return False
+
+        # Switch to new source if needed
+        if source_index != self.source_index:
+            self.source_index = source_index
             self._new_video(self.files[self.source_index])
-        target_frame = (target_timecode - self._timecodes[self.source_index]).frames
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-        return int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) == target_frame
+
+        # Calculate frame position within the source and seek
+        source_start_timecode = self._timecodes[self.source_index]
+        source_length = self._frame_lengths[self.source_index]
+        if target_timecode == source_start_timecode:
+            # If the target timecode is exactly the start of the source, we can seek to frame 0
+            target_source_frame = 0
+            self.gap_offset = 0
+        else:
+            target_source_frame = (target_timecode - source_start_timecode).frames
+            if target_source_frame >= source_length:
+                # This must be a gap, so we need to adjust the target frame
+                self.gap_offset = target_source_frame - source_length
+                # FIXME: The last index should be length - 1, but for some reason the last frame is actually at length instead? Why?
+                target_source_frame = source_length  # Last frame of the current source
+            else:
+                self.gap_offset = 0
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_source_frame)
+        self._source_frame = target_source_frame
+        # Update current frame position including gaps
+        self._current_frame = self._timecodes[self.source_index].frames - self._timecodes[
+            0].frames + target_source_frame + self.gap_offset
+        # Verify seek was successful
+        return int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) == target_source_frame
 
     def seek_timecode_frame(self, target_frame):
-        target_timecode = Timecode(self._timecodes[0].framerate, frames=target_frame)
+        target_timecode = Timecode(self.get_fps(), frames=target_frame)
         self.seek_timecode(target_timecode)
 
     def __len__(self):
         """Returns the number of batches in the object."""
-        return math.ceil(sum(self._frame_lengths) / self.bs)  # number of files
-
+        total_frames = sum(self._frame_lengths) + sum(self.gaps)
+        return math.ceil(total_frames / self.bs)
 
 def get_capture_times_from_exif(jpg_directory: pathlib.Path) -> SortedDict:
     frame_times = SortedDict()

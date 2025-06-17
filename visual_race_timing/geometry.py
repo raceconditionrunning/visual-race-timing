@@ -47,7 +47,7 @@ def do_intersect(p1, q1, p2, q2):
 def line_segment_intersects_boxes(p1, p2, boxes):
     """Check if a line segment intersects with multiple bounding boxes."""
     p1, p2 = np.atleast_2d(p1), np.atleast_2d(p2)
-    boxes = np.array(boxes)
+    boxes = np.atleast_2d(boxes)
 
     xmin, ymin, xmax, ymax = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
 
@@ -95,10 +95,10 @@ def point_to_line_distance(points, p1, p2):
     return np.linalg.norm(nearest_point - points, axis=1)
 
 
-def line_segment_to_box_distance(p1, p2, boxes):
+def line_segment_to_box_distance(p1, p2, boxes_xyxy):
     """Calculate the shortest distance from a line segment to multiple bounding boxes in batch."""
     p1, p2 = np.atleast_2d(p1), np.atleast_2d(p2)
-    boxes = np.array(boxes)
+    boxes = np.atleast_2d(boxes_xyxy)
 
     # Check if the line segment intersects any of the boxes
     intersections = line_segment_intersects_boxes(p1, p2, boxes)

@@ -1,303 +1,655 @@
-import csv
+import itertools
+import sqlite3
+import json
 import pathlib
 from collections import defaultdict
-from typing import Dict
+from typing import Dict, List, Tuple, Optional
 from pathlib import Path
-from typing import Optional, List, Tuple
-
 import numpy as np
+import tqdm
 import ultralytics.utils
-from sortedcontainers import SortedDict
-from tqdm import tqdm
 from ultralytics.engine.results import Boxes, Keypoints
+from ultralytics.utils.ops import xywhn2xyxy
 
 
-def save_txt_annotation(boxes: Boxes, kpts: Keypoints, crossings, txt_file: pathlib.Path, replace=False):
-    texts = []
-    # Detect/segment/pose
-    for j, d in enumerate(boxes):
-        c, conf, track_id = int(d.cls), float(d.conf), None if d.id is None else int(d.id.item())
-        line = (c, *(d.xywhn.flatten()), conf)
-        line += ((-1,) if track_id is None else (track_id,)) + (int(crossings[j]),)
-        if kpts is not None:
-            kpt = np.concatenate((kpts[j].xyn, kpts[j].conf[..., None]), 2) if kpts[j].has_visible else kpts[j].xyn
-            line += (*kpt.reshape(-1).tolist(),)
-        texts.append(("%g " * len(line)).rstrip() % line)
+class SQLiteAnnotationStore:
+    # Source type constants
+    SOURCE_HUMAN = 'human'
+    SOURCE_TRACKING = 'tracking'
 
-    if texts:
-        Path(txt_file).parent.mkdir(parents=True, exist_ok=True)  # make directory
-        mode = "w" if replace else "a"
-        with open(txt_file, mode) as f:
-            f.writelines(text + "\n" for text in texts)
-    elif replace and Path(txt_file).exists():
-        # Delete empty file
-        Path(txt_file).unlink()
+    def __init__(self, db_path: pathlib.Path):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_database()
 
+    def _init_database(self):
+        """Initialize the database schema"""
+        with sqlite3.connect(self.db_path) as conn:
+            # Enable WAL mode for better concurrency
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
 
-def load_txt_annotation(txt_file: pathlib.Path, img_size=(1920, 1080)):
-    with open(txt_file, "r") as f:
-        lines = f.readlines()
-    boxes = []
-    kpts = []
-    crossings = []
-    for line in lines:
-        line = line.split()
-        obj_class = int(line[0])
-        if len(line) >= 8:
-            xywhn = np.array([float(x) for x in line[1:5]])
-            conf = float(line[5])
-            track_id = int(line[6])
-            crossings.append(bool(line[7] != "0"))
-            """if line[7] != "1" and line[7] != "0":
-                print(f"Invalid line: {line} in {txt_file}")"""
-            xyxy = ultralytics.utils.ops.xywhn2xyxy(xywhn, *img_size)
-        if len(line) >= 59:
-            kpt = np.array([float(x) for x in line[8:59]]).reshape(17, 3)
-            kpt[:, 0] *= img_size[0]
-            kpt[:, 1] *= img_size[1]
-            # conf = float(line[56])
-            kpts.append(kpt)
+            conn.executescript('''
+                               CREATE TABLE IF NOT EXISTS annotations
+                               (
+                                   id
+                                   INTEGER
+                                   PRIMARY
+                                   KEY
+                                   AUTOINCREMENT,
+                                   frame_number
+                                   INTEGER,
+                                   runner_id
+                                   INTEGER, -- -1 when no tracking available
+                                   class_id
+                                   INTEGER,
+                                   x_center
+                                   REAL,
+                                   y_center
+                                   REAL,
+                                   width
+                                   REAL,
+                                   height
+                                   REAL,
+                                   confidence
+                                   REAL,
+                                   is_crossing
+                                   BOOLEAN,
+                                   keypoints
+                                   TEXT,
+                                   source
+                                   TEXT,
+                                   created_at
+                                   TIMESTAMP
+                                   DEFAULT
+                                   CURRENT_TIMESTAMP,
+                                   modified_at
+                                   TIMESTAMP
+                                   DEFAULT
+                                   CURRENT_TIMESTAMP
+                               );
 
-        if track_id is not None:
-            box = np.hstack((xyxy, [track_id], [conf], [obj_class]))
-        else:
-            box = np.hstack((xyxy, [conf], [obj_class]))
-        boxes.append(box)
-    return np.array(boxes), np.array(kpts) if kpts else None, np.array(crossings)
+                               -- Create a partial unique index for tracked detections only
+                               CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_tracked
+                                   ON annotations(frame_number, runner_id)
+                                   WHERE runner_id != -1;
 
+                               CREATE TABLE IF NOT EXISTS notes
+                               (
+                                   frame_number
+                                   INTEGER,
+                                   runner_id
+                                   INTEGER,
+                                   note
+                                   TEXT,
+                                   PRIMARY
+                                   KEY
+                               (
+                                   frame_number,
+                                   runner_id
+                               )
+                                   );
 
-def load_annotations(annotations_path: pathlib.Path, img_size: Tuple[int, int]) -> SortedDict[int, Dict[str, any]]:
-    annotations = SortedDict()
-    if not annotations_path.exists():
+                               -- Indexes for performance
+                               CREATE INDEX IF NOT EXISTS idx_frame ON annotations(frame_number);
+                               CREATE INDEX IF NOT EXISTS idx_runner ON annotations(runner_id);
+                               CREATE INDEX IF NOT EXISTS idx_crossings ON annotations(is_crossing);
+                               CREATE INDEX IF NOT EXISTS idx_frame_crossing ON annotations(frame_number, is_crossing);
+                               CREATE INDEX IF NOT EXISTS idx_source ON annotations(source);
+                               CREATE INDEX IF NOT EXISTS idx_frame_source ON annotations(frame_number, source);
+                               CREATE INDEX IF NOT EXISTS idx_notes_frame ON notes(frame_number);
+                               CREATE INDEX IF NOT EXISTS idx_notes_runner ON notes(runner_id);
+
+                               -- Trigger to update modified_at
+                               CREATE TRIGGER IF NOT EXISTS update_modified_time 
+                AFTER
+                               UPDATE ON annotations
+                               BEGIN
+                               UPDATE annotations
+                               SET modified_at = CURRENT_TIMESTAMP
+                               WHERE frame_number = NEW.frame_number
+                                 AND runner_id = NEW.runner_id;
+                               END;
+                               ''')
+
+    def _parse_runner_id(self, runner_id):
+        """Convert runner_id to int, handling both int and hex string formats"""
+        if isinstance(runner_id, str):
+            # Check if it's a hex string
+            try:
+                return int(runner_id, 16)
+            except ValueError:
+                return int(runner_id)
+        return int(runner_id)
+
+    def save_annotation(self, frame_number: int, boxes: Boxes, kpts: Keypoints, crossings, source=None, replace=False,
+                        ):
+        """Save annotations for a single frame"""
+        with sqlite3.connect(self.db_path) as conn:
+            if replace is True:
+                if source is None or type(source) is not str:
+                    raise ValueError("Cannot replace annotations without specifying a source")
+                elif source == 'all':
+                    # Replace all annotations for this frame
+                    conn.execute("DELETE FROM annotations WHERE frame_number = ?", (frame_number,))
+                else:
+                    conn.execute("DELETE FROM annotations WHERE frame_number = ? AND source = ?",
+                                 (frame_number, source))
+
+            for j, box in enumerate(boxes.data):
+                if len(box) == 7:
+                    # Handle YOLO format: [class_id, x1, y1, x2, y2, confidence, runner_id]
+                    x1, y1, x2, y2, runner_id, confidence, class_id = box.tolist()
+                else:
+                    x_center, y_center, width, height, confidence, class_id = box.tolist()
+                    runner_id = -1
+                x, y, w, h = boxes.xywhn[j].tolist()
+                runner_id = int(runner_id)
+                is_crossing = bool(crossings[j]) if j < len(crossings) else False
+
+                # Handle keypoints
+                keypoints_json = None
+                if kpts is not None and j < len(kpts.data):
+                    kpt_data = kpts.data[j].reshape(17, 3).tolist()
+                    keypoints_json = json.dumps(kpt_data)
+
+                row_source = source
+                if type(source) is not str:
+                    row_source = source[j]
+                conn.execute('''
+                    INSERT OR REPLACE INTO annotations 
+                    (frame_number, runner_id, class_id, x_center, y_center, width, height, confidence, is_crossing, keypoints, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (frame_number, runner_id, int(class_id), x, y, w, h, confidence, is_crossing, keypoints_json,
+                      row_source))
+
+    def get_frame_annotation(self, frame_number: int, img_shape=None, source=None) -> Tuple[
+        np.ndarray, np.ndarray, np.ndarray, list]:
+        """Load annotations for a single frame
+
+        Args:
+            frame_number: Frame to load
+            img_shape: Image dimensions for keypoint scaling
+            source: Filter by source ('human', 'detection', etc.) or None for all
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            if source == 'detection':
+                cursor = conn.execute('''
+                                      SELECT frame_number,
+                                             runner_id,
+                                             class_id,
+                                             x_center,
+                                             y_center,
+                                             width,
+                                             height,
+                                             confidence,
+                                             is_crossing,
+                                             keypoints,
+                                             source
+                                      FROM annotations
+                                      WHERE frame_number = ?
+                                        AND source != 'human'
+                                      ORDER BY runner_id
+                                      ''', (frame_number,))
+            elif source is not None:
+                cursor = conn.execute('''
+                                      SELECT frame_number,
+                                             runner_id,
+                                             class_id,
+                                             x_center,
+                                             y_center,
+                                             width,
+                                             height,
+                                             confidence,
+                                             is_crossing,
+                                             keypoints,
+                                             source
+                                      FROM annotations
+                                      WHERE frame_number = ?
+                                        AND source = ?
+                                      ORDER BY runner_id
+                                      ''', (frame_number, source))
+            else:
+                # Return all annotations, ordered by source priority (human first)
+                cursor = conn.execute('''
+                                      SELECT frame_number,
+                                             runner_id,
+                                             class_id,
+                                             x_center,
+                                             y_center,
+                                             width,
+                                             height,
+                                             confidence,
+                                             is_crossing,
+                                             keypoints,
+                                             source
+                                      FROM annotations
+                                      WHERE frame_number = ?
+                                      ORDER BY CASE source
+                                                   WHEN 'human' THEN 1
+                                                   WHEN 'tracking' THEN 2
+                                                   WHEN 'detection' THEN 3
+                                                   ELSE 4
+                                                   END,
+                                               runner_id
+                                      ''', (frame_number,))
+
+            rows = cursor.fetchall()
+
+        return self._format_rows(rows, img_shape)
+
+    def _format_rows(self, rows, img_shape):
+        if not rows:
+            return np.empty((0, 7)), None, np.array([]), []
+
+        boxes = []
+        kpts = []
+        crossings = []
+        sources = []
+
+        for row in rows:
+            _, runner_id, class_id, x_center, y_center, width, height, confidence, is_crossing, keypoints_json, row_source = row
+
+            box = np.array([x_center, y_center, width, height, runner_id, confidence, class_id])
+            boxes.append(box)
+            crossings.append(bool(is_crossing))
+
+            # Handle keypoints - convert back to pixels
+            if keypoints_json:
+                kpt_data = np.array(json.loads(keypoints_json))
+                # Convert normalized coordinates back to pixels
+                if img_shape:
+                    kpt_data[:, 0] *= img_shape[1]
+                    kpt_data[:, 1] *= img_shape[0]
+                kpts.append(kpt_data)
+
+        boxes_array = np.array(boxes) if boxes else np.empty((0, 7))
+        if img_shape:
+            # Convert YOLO format (x_center, y_center, width, height) to (x1, y1, x2, y2)
+            boxes_array[:, :4] = xywhn2xyxy(boxes_array[:, :4], *img_shape[::-1])
+        kpts_array = np.array(kpts) if kpts else None
+        crossings_array = np.array(crossings)
+
+        return boxes_array, kpts_array, crossings_array, sources
+
+    def load_all_annotations(self, img_shape=None, source=None, crossing=None) -> Dict[int, Dict[str, any]]:
+        """Load all annotations, equivalent to your load_annotations function"""
+        query_filters = []
+        params = []
+        with sqlite3.connect(self.db_path) as conn:
+            if crossing is not None:
+                query_filters.append("is_crossing = ?")
+                params.append(crossing)
+            if source:
+                if source == 'detection':
+                    query_filters.append("source != 'human'")
+                else:
+                    query_filters.append("source = ?")
+                    params.append(source)
+            cursor = conn.execute(f'''SELECT frame_number,
+                                            runner_id,
+                                             class_id,
+                                             x_center,
+                                             y_center,
+                                             width,
+                                             height,
+                                             confidence,
+                                             is_crossing,
+                                             keypoints,
+                                          source FROM annotations WHERE {' AND '.join(query_filters)} ORDER BY frame_number''',
+                                  params)
+
+        annotations = {}
+        for frame_number, group in itertools.groupby(cursor, key=lambda x: x[0]):
+            boxes, kpts, crossings, sources = self._format_rows(list(group), img_shape)
+            # boxes, kpts, crossings = self.remove_duplicates(boxes, kpts, crossings)
+            annotations[frame_number] = {'boxes': boxes, 'kpts': kpts, 'crossings': crossings, 'sources': sources}
+
         return annotations
-    for txt_file in tqdm(annotations_path.glob("frame_*.txt")):
-        # Extract frame number from the txt file name ("frame_NUMBER.txt")
-        frame = int(txt_file.stem.split('_')[-1])
-        boxes, kpts, crossings = load_txt_annotation(txt_file, img_size)
-        boxes, kpts, crossings = remove_duplicates(boxes, kpts, crossings)
-        annotations[frame] = {'boxes': boxes, 'kpts': kpts, 'crossings': crossings}
-    return annotations
 
+    def save_notes(self, notes: Dict[int, Dict[str, str]]):
+        """Save notes to database"""
+        with sqlite3.connect(self.db_path) as conn:
+            # Clear existing notes
+            conn.execute("DELETE FROM notes")
 
-def load_notes(notes_path: pathlib.Path) -> Dict[int, Dict[str, str]]:
-    notes = defaultdict(dict)
-    if not notes_path.exists():
+            for frame_num, frame_notes in notes.items():
+                for runner_id, note in frame_notes.items():
+                    runner_id_int = self._parse_runner_id(runner_id)
+                    conn.execute('''
+                                 INSERT INTO notes (frame_number, runner_id, note)
+                                 VALUES (?, ?, ?)
+                                 ''', (frame_num, runner_id_int, note))
+
+    def get_notes(self, frame_number: int) -> Dict[str, str]:
+        """Get notes for a specific frame"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT runner_id, note FROM notes WHERE frame_number = ?", (frame_number,))
+            notes = {format(row[0], '02x'): row[1] for row in cursor.fetchall()}
         return notes
 
-    with open(notes_path, "r") as f:
-        # Each line is a note. First column is frame num, second is runner ID, second column is note
-        lines = csv.reader(f, delimiter='\t')
-        for line in lines:
-            frame = int(line[0])
-            note = line[2]
-            runner_id = format(int(line[1]), '02x')
-            notes[frame][runner_id] = note
-    return notes
+    def update_notes(self, frame_number: int, runner_id: str, note: str):
+        """Update or insert a note for a specific frame and runner"""
+        runner_id_int = self._parse_runner_id(runner_id)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                         INSERT INTO notes (frame_number, runner_id, note)
+                         VALUES (?, ?, ?) ON CONFLICT(frame_number, runner_id) DO
+                         UPDATE SET note = ?
+                         ''', (frame_number, runner_id_int, note, note))
 
+    def load_notes(self) -> Dict[int, Dict[str, str]]:
+        """Load notes from database"""
+        notes = defaultdict(dict)
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT frame_number, runner_id, note FROM notes")
+            for frame_num, runner_id, note in cursor.fetchall():
+                # Convert runner_id back to hex string for compatibility
+                notes[frame_num][format(runner_id, '02x')] = note
+        return dict(notes)
 
-def save_notes(notes: Dict[int, Dict[str, str]], notes_path: pathlib.Path):
-    with open(notes_path, "w") as f:
-        writer = csv.writer(f, delimiter='\t')
-        ordered_frame_nums = sorted(list(notes.keys()))
-        for frame in ordered_frame_nums:
-            frame_notes = notes[frame]
-            for runner_id, note in frame_notes.items():
-                writer.writerow([frame, int(runner_id, 16), note])
+    def scan_to_annotation(self, from_frame_num: int, runner_id: int = None,
+                           crossing=None, previous=False, max_scan=None, source=None,
+                           custom_check=None) -> Optional[int]:
+        """Find next/previous annotation matching criteria"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row  # Enable dict-like access to columns
 
+            # Build the query based on parameters
+            conditions = []
+            params = []
 
-def distance_to_zeros(arr: np.ndarray) -> np.ndarray:
-    large_number = arr.shape[1]
-    for batch_idx in range(arr.shape[0]):
-        x = arr[batch_idx]
-        indices = np.arange(x.size)
-        zeroes = x == 0
-        if not any(zeroes):
-            arr[batch_idx] = np.full_like(x, large_number)
-            continue
-        forward = indices - np.maximum.accumulate(indices * zeroes)  # forward distance
-        forward[np.cumsum(zeroes) == 0] = x.size - 1  # handle absence of zero from edge
-        forward = forward * (x != 0)  # set zero positions to zero
-
-        zeroes = zeroes[::-1]
-        backward = indices - np.maximum.accumulate(indices * zeroes)  # backward distance
-        backward[np.cumsum(zeroes) == 0] = x.size - 1  # handle absence of zero from edge
-        backward = backward[::-1] * (x != 0)  # set zero positions to zero
-
-        sign_should_flip = forward < backward
-        arr[batch_idx] = np.minimum(forward, backward)  # closest distance (minimum)
-        arr[batch_idx][sign_should_flip] *= -1
-    return arr
-
-
-def build_crossing_map(annotations: Dict[int, any]) -> np.ndarray:
-    # For each index, for each runner, how many frames away and in what direction is the nearest crossing
-    # -1 if no crossing
-    # 0 if this frame is a crossing
-    all_frame_nums = list(annotations.keys())
-    all_frame_nums.sort()
-    large_number = len(all_frame_nums)
-    all_runner_ids = set()
-    for frame_num in all_frame_nums:
-        all_runner_ids.update(annotations[frame_num]['boxes'][:, 4].astype(int))
-    all_runner_ids = sorted(list(all_runner_ids))
-    crossing_map = np.full((len(all_runner_ids), len(all_frame_nums)), large_number, dtype=int)
-    for i, frame_num in enumerate(all_frame_nums):
-        for j, box in enumerate(annotations[frame_num]['boxes']):
-            if annotations[frame_num]['crossings'][j]:
-                runner_id = int(box[4])
-                runner_idx = all_runner_ids.index(runner_id)
-                crossing_map[runner_idx, i] = 0
-
-    distance_map = distance_to_zeros(crossing_map)
-    valid_idx = np.where(distance_map < large_number)
-    pointed_to = np.zeros_like(distance_map)
-    pointed_to[valid_idx] = valid_idx[1] + distance_map[valid_idx]
-    all_frame_nums = np.array(all_frame_nums)
-    distance_map[valid_idx] = all_frame_nums[pointed_to[valid_idx].flatten()] - all_frame_nums[valid_idx[1]]
-
-    return distance_map
-
-
-def scan_to_annotation(annotations: SortedDict[int, any], from_frame_num: int, runner_id: int | None = None,
-                       crossing=None, previous=False, custom_check=None, max_scan=None) -> Optional[int]:
-    if previous:
-        to_end_index = annotations.bisect_left(from_frame_num)  # May include from_frame_num
-        to_start_index = 0
-        if max_scan is not None:
-            min_frame_num = from_frame_num - max_scan
-            to_start_index = max(to_start_index, annotations.bisect_left(min_frame_num))  # Left bisect result is >=0
-
-    else:
-        to_start_index = annotations.bisect(from_frame_num)
-        to_end_index = len(annotations)
-        if max_scan is not None:
-            max_frame_num = from_frame_num + max_scan
-            to_end_index = min(to_end_index,
-                               annotations.bisect_right(max_frame_num))  # Max index might be off end, but that's fine
-
-    for frame_num in annotations.islice(to_start_index, to_end_index, reverse=previous):
-        if frame_num == from_frame_num:
-            continue
-        annotation = annotations[frame_num]
-        if len(annotation['boxes']) == 0:
-            continue
-        custom_check_result = custom_check(annotation) if custom_check is not None else True
-        if not custom_check_result:
-            continue
-        if runner_id is not None and np.where(annotation['boxes'][:, 4] == runner_id)[0].size > 0:
-            # Looking for a specific runner
-            if crossing is None:
-                return frame_num
-            elif annotation['crossings'][np.where(annotation['boxes'][:, 4] == runner_id)[0][0]] == crossing:
-                return frame_num
-        elif runner_id is None and crossing is not None:
-            # Annotation with any runner crossing is fine
-            if crossing and any(annotation['crossings']):
-                return frame_num
-            elif not crossing and not any(annotation['crossings']):
-                return frame_num
-        elif runner_id is None and crossing is None:
-            # Any annotation flies!
-            return frame_num
-    return None
-
-
-def get_nearby(annotations: Dict[int, any], to_frame_num: int, buffer_s: int = 5, runner_id: int = None,
-               crossing=None) -> List[int]:
-    # Get the nearest crossing to the current frame
-    nearby = []
-    start_frame = to_frame_num - buffer_s * 30
-    end_frame = to_frame_num + buffer_s * 30
-    for frame_num in range(start_frame, end_frame):
-        if frame_num not in annotations:
-            continue
-        annotation = annotations[frame_num]
-        # Check if the runner_id is in the annotations
-        if runner_id is not None:
-            if runner_id not in annotation['boxes'][:, 4]:
-                continue
-            if crossing is not None:
-                if crossing != annotation['crossings'][np.where(annotation['boxes'][:, 4] == runner_id)[0][0]]:
-                    continue
-        nearby.append(frame_num)
-
-    return nearby
-
-
-def delete_frame_annotation(annotation, runner_id):
-    boxes = annotation['boxes']
-    kpts = annotation['kpts']
-    crossings = annotation['crossings']
-    # Delete the annotation
-    annotation_idx = np.where(boxes[:, 4] == int(runner_id, 16))[0][0]
-    boxes = np.delete(boxes, annotation_idx, axis=0)
-    if kpts:
-        kpts = np.delete(kpts, annotation_idx, axis=0)
-    crossings = np.delete(crossings, annotation_idx, axis=0)
-    return {'boxes': boxes, 'kpts': kpts, 'crossings': crossings}
-
-
-def mark_frame_crossing(annotation, runner_id: str, crossing=None):
-    # Mark this frame as a crossing
-    annotation_idx = np.where(annotation["boxes"][:, 4] == int(runner_id, 16))
-    if len(annotation_idx) == 0:
-        print(f"Runner {runner_id} not found in annotation")
-        return annotation
-    annotation_idx = annotation_idx[0][0]
-    annotation['crossings'][annotation_idx] = not annotation['crossings'][
-        annotation_idx] if crossing is None else crossing
-    return annotation
-
-
-def update_annotation(annotations: Dict[int, any], frame_num: int, boxes: Boxes, kpts: Keypoints, crossings):
-    if frame_num in annotations:
-        # Check if there's already an annotation matching this id
-        existing_annotation = annotations[frame_num]
-        existing_boxes = existing_annotation['boxes']
-        for i, new_box in enumerate(boxes):
-            runner_id = int(new_box.data[0, 4])
-            if runner_id in existing_boxes[:, 4]:
-                # Get the existing index
-                annotation_idx = np.where(existing_boxes[:, 4] == runner_id)[0][0]
-                existing_boxes[annotation_idx] = new_box.data
+            if previous:
+                conditions.append("frame_number < ?")
+                order = "DESC"
             else:
-                # Add the new annotation at the end
-                existing_annotation["boxes"] = np.vstack((existing_boxes, new_box.data))
-                if existing_annotation['kpts'] is not None:
-                    existing_annotation['kpts'] = np.vstack((existing_annotation['kpts'], np.zeros((17, 3))))
-                existing_annotation['crossings'] = np.concatenate((existing_annotation['crossings'], [True]))
-            annotations[frame_num] = existing_annotation
-    else:
-        # Chop the internal id off the track result
-        annotations[frame_num] = {'boxes': boxes.data, 'kpts': None if kpts is None else kpts.data,
-                                  'crossings': crossings}
-    return annotations[frame_num]
+                conditions.append("frame_number > ?")
+                order = "ASC"
+            params.append(from_frame_num)
 
+            if max_scan is not None:
+                if previous:
+                    conditions.append("frame_number >= ?")
+                    params.append(from_frame_num - max_scan)
+                else:
+                    conditions.append("frame_number <= ?")
+                    params.append(from_frame_num + max_scan)
 
-def reassign_frame_annotation(annotation, from_id, to_id):
-    annotation_idx = np.where(annotation['boxes'][:, 4] == int(from_id, 16))[0][0]
-    annotation['boxes'][annotation_idx, 4] = int(to_id, 16)
-    return annotation
+            if runner_id is not None:
+                conditions.append("runner_id = ?")
+                params.append(runner_id)
 
+            if crossing is not None:
+                conditions.append("is_crossing = ?")
+                params.append(crossing)
 
-def remove_duplicates(boxes: Boxes, kpts: Keypoints, crossings):
-    # Remove any boxes that have a duplicated non-zero track_id
-    track_ids = boxes[:, 4]
-    unique_ids = np.unique(track_ids)
-    for track_id in unique_ids:
-        if track_id == -1:
-            continue
+            if source is not None:
+                if source == 'detection':
+                    conditions.append("source != 'human'")
+                else:
+                    conditions.append("source = ?")
+                    params.append(source)
+
+            query = f'''
+                SELECT * FROM annotations 
+                WHERE {' AND '.join(conditions)}
+                ORDER BY frame_number {order}
+            '''
+
+            # Add LIMIT only if no custom check (for performance)
+            if custom_check is None:
+                query += " LIMIT 1"
+
+            cursor = conn.execute(query, params)
+
+            if custom_check is None:
+                # Simple case - return first match
+                result = cursor.fetchone()
+                return result['frame_number'] if result else None
+            else:
+                # Custom check case - iterate until condition is met
+                try:
+                    for row in cursor:
+                        row_dict = dict(row)
+                        if custom_check(row_dict):
+                            return row_dict['frame_number']
+                    return None
+                except Exception as e:
+                    # Handle lambda evaluation errors gracefully
+                    print(f"Error in custom_check: {e}")
+                    return None
+
+    def get_nearby(self, to_frame_num: int, buffer_s: int = 5, runner_id: int = None,
+                   crossing=None, source=None) -> List[int]:
+        """Get nearby frames within buffer_s seconds (30fps assumed)"""
+        start_frame = to_frame_num - buffer_s * 30
+        end_frame = to_frame_num + buffer_s * 30
+
+        with sqlite3.connect(self.db_path) as conn:
+            conditions = ["frame_number BETWEEN ? AND ?"]
+            params = [start_frame, end_frame]
+
+            if runner_id is not None:
+                conditions.append("runner_id = ?")
+                params.append(runner_id)
+
+            if crossing is not None:
+                conditions.append("is_crossing = ?")
+                params.append(crossing)
+
+            if source is not None:
+                conditions.append("source = ?")
+                params.append(source)
+
+            query = f'''
+                SELECT DISTINCT frame_number FROM annotations 
+                WHERE {' AND '.join(conditions)}
+                ORDER BY frame_number
+            '''
+
+            cursor = conn.execute(query, params)
+            return [row[0] for row in cursor.fetchall()]
+
+    def delete_frame_annotation(self, frame_number: int, runner_id: str):
+        """Delete annotation for specific runner in frame"""
+        runner_id_int = self._parse_runner_id(runner_id)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                         DELETE
+                         FROM annotations
+                         WHERE frame_number = ?
+                           AND runner_id = ?
+                         ''', (frame_number, runner_id_int))
+
+    def mark_frame_crossing(self, frame_number: int, runner_id: str, crossing=None) -> bool:
+        """Mark/unmark frame as crossing for specific runner
+        returns the new crossing state
+        """
+        runner_id_int = self._parse_runner_id(runner_id)
+        with sqlite3.connect(self.db_path) as conn:
+            if crossing is None:
+                cursor = conn.execute('''
+                                      UPDATE annotations
+                                      SET is_crossing = NOT is_crossing
+                                      WHERE frame_number = ?
+                                        AND runner_id = ? RETURNING is_crossing
+                                      ''', (frame_number, runner_id_int))
+            else:
+                cursor = conn.execute('''
+                                      UPDATE annotations
+                                      SET is_crossing = ?
+                                      WHERE frame_number = ?
+                                        AND runner_id = ? RETURNING is_crossing
+                                      ''', (crossing, frame_number, runner_id_int))
+
+            result = cursor.fetchone()
+            return result[0] if result else None
+
+    def get_last_frame(self, source: str = None) -> Optional[int]:
+        """Get the last frame number with annotations"""
+        with sqlite3.connect(self.db_path) as conn:
+            if source:
+                cursor = conn.execute('''
+                                      SELECT MAX(frame_number)
+                                      FROM annotations
+                                      WHERE source = ?
+                                      ''', (source,))
+            else:
+                cursor = conn.execute('SELECT MAX(frame_number) FROM annotations')
+            result = cursor.fetchone()
+            return result[0] if result and result[0] is not None else None
+
+    def update_annotation(self, frame_number: int, boxes: Boxes, kpts: Keypoints, crossings, source='human'):
+        """Update annotations for a frame - simplest approach using existing methods"""
+
+        # Extract runner_ids from the new boxes
+        new_runner_ids = []
+        for box in boxes.data:
+            runner_id = int(box[4])
+            new_runner_ids.append(runner_id)
+
+        # Delete existing annotations for only these specific runners
+        if new_runner_ids:
+            with sqlite3.connect(self.db_path) as conn:
+                placeholders = ','.join('?' * len(new_runner_ids))
+                conn.execute(f'''
+                    DELETE FROM annotations 
+                    WHERE frame_number = ? AND source = ? AND runner_id IN ({placeholders})
+                ''', [frame_number, source] + new_runner_ids)
+
+        # Use existing save_annotation method to insert the new data
+        self.save_annotation(frame_number, boxes, kpts, crossings, source=source, replace=False)
+
+    def _save_frame_data(self, frame_number: int, boxes: np.ndarray, kpts: np.ndarray, crossings: np.ndarray,
+                         source: str, replace=False):
+        """Internal method to save frame data in internal format"""
+        with sqlite3.connect(self.db_path) as conn:
+            if replace:
+                conn.execute("DELETE FROM annotations WHERE frame_number = ? AND source = ?",
+                             (frame_number, source))
+
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2, runner_id, confidence, class_id = box
+                is_crossing = bool(crossings[i]) if i < len(crossings) else False
+
+                keypoints_json = None
+                if kpts is not None and i < len(kpts):
+                    keypoints_json = json.dumps(kpts[i].tolist())
+
+                conn.execute('''
+                    INSERT OR REPLACE INTO annotations 
+                    (frame_number, runner_id, class_id, x_center, y_center, width, height, confidence, is_crossing, keypoints, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (frame_number, int(runner_id), int(class_id), x1, y1, x2, y2, confidence, is_crossing,
+                      keypoints_json, source))
+
+    def reassign_frame_annotation(self, frame_number: int, from_id: str, to_id: str):
+        """Reassign runner ID in a frame"""
+        from_id_int = self._parse_runner_id(from_id)
+        to_id_int = self._parse_runner_id(to_id)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                         UPDATE annotations
+                         SET runner_id = ?
+                         WHERE frame_number = ?
+                           AND runner_id = ?
+                         ''', (to_id_int, frame_number, from_id_int))
+
+    def build_crossing_map(self) -> np.ndarray:
+        """Build crossing distance map - much more efficient with SQL"""
+        with sqlite3.connect(self.db_path) as conn:
+            # Get all frame numbers and runner IDs
+            cursor = conn.execute("SELECT DISTINCT frame_number FROM annotations ORDER BY frame_number")
+            all_frame_nums = [row[0] for row in cursor.fetchall()]
+
+            cursor = conn.execute("SELECT DISTINCT runner_id FROM annotations ORDER BY runner_id")
+            all_runner_ids = [row[0] for row in cursor.fetchall()]
+
+            if not all_frame_nums or not all_runner_ids:
+                return np.array([])
+
+            # Create crossing map
+            crossing_map = np.full((len(all_runner_ids), len(all_frame_nums)), len(all_frame_nums), dtype=int)
+
+            # Fill in crossings
+            cursor = conn.execute('''
+                                  SELECT frame_number, runner_id
+                                  FROM annotations
+                                  WHERE is_crossing = 1
+                                  ''')
+
+            for frame_num, runner_id in cursor.fetchall():
+                if frame_num in all_frame_nums and runner_id in all_runner_ids:
+                    frame_idx = all_frame_nums.index(frame_num)
+                    runner_idx = all_runner_ids.index(runner_id)
+                    crossing_map[runner_idx, frame_idx] = 0
+
+            # Apply distance calculation (reusing your existing function)
+            distance_map = self._distance_to_zeros(crossing_map)
+
+            # Convert to actual frame differences
+            valid_idx = np.where(distance_map < len(all_frame_nums))
+            pointed_to = np.zeros_like(distance_map)
+            pointed_to[valid_idx] = valid_idx[1] + distance_map[valid_idx]
+            all_frame_nums_array = np.array(all_frame_nums)
+            distance_map[valid_idx] = all_frame_nums_array[pointed_to[valid_idx].flatten()] - all_frame_nums_array[
+                valid_idx[1]]
+
+            return distance_map
+
+    @staticmethod
+    def _distance_to_zeros(arr: np.ndarray) -> np.ndarray:
+        """Reusing your existing distance calculation logic"""
+        large_number = arr.shape[1]
+        for batch_idx in range(arr.shape[0]):
+            x = arr[batch_idx]
+            indices = np.arange(x.size)
+            zeroes = x == 0
+            if not any(zeroes):
+                arr[batch_idx] = np.full_like(x, large_number)
+                continue
+            forward = indices - np.maximum.accumulate(indices * zeroes)
+            forward[np.cumsum(zeroes) == 0] = x.size - 1
+            forward = forward * (x != 0)
+
+            zeroes = zeroes[::-1]
+            backward = indices - np.maximum.accumulate(indices * zeroes)
+            backward[np.cumsum(zeroes) == 0] = x.size - 1
+            backward = backward[::-1] * (x != 0)
+
+            sign_should_flip = forward < backward
+            arr[batch_idx] = np.minimum(forward, backward)
+            arr[batch_idx][sign_should_flip] *= -1
+        return arr
+
+    @staticmethod
+    def remove_duplicates(boxes: np.ndarray, kpts: np.ndarray, crossings: np.ndarray):
+        """Remove duplicate runner IDs, keeping highest confidence"""
+        if len(boxes) == 0:
+            return boxes, kpts, crossings
+
         track_ids = boxes[:, 4]
-        track_idx = np.where(track_ids == track_id)[0]
-        if len(track_idx) > 1:
-            # Remove the box with the lowest confidence
-            min_conf_idx = np.argmin(boxes[track_idx, 5])
-            remove_idx = np.delete(track_idx, min_conf_idx)
-            boxes = np.delete(boxes, remove_idx, axis=0)
-            if kpts is not None:
-                kpts = np.delete(kpts, remove_idx, axis=0)
-            crossings = np.delete(crossings, remove_idx, axis=0)
-    return boxes, kpts, crossings
+        unique_ids = np.unique(track_ids)
+
+        for track_id in unique_ids:
+            if track_id == -1:
+                continue
+            track_idx = np.where(track_ids == track_id)[0]
+            if len(track_idx) > 1:
+                # Keep the box with highest confidence (index 5)
+                max_conf_idx = np.argmax(boxes[track_idx, 5])
+                keep_idx = track_idx[max_conf_idx]
+                remove_idx = track_idx[track_idx != keep_idx]
+
+                boxes = np.delete(boxes, remove_idx, axis=0)
+                if kpts is not None:
+                    kpts = np.delete(kpts, remove_idx, axis=0)
+                crossings = np.delete(crossings, remove_idx, axis=0)
+
+                # Update track_ids array for next iteration
+                track_ids = boxes[:, 4]
+
+        return boxes, kpts, crossings
 
 
 def offset_with_crop(boxes: Boxes, kpts: Keypoints, crop: List[int], uncropped_shape: Tuple[int, int]):

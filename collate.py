@@ -11,7 +11,7 @@ import yaml
 from timecode import Timecode
 from tqdm import tqdm
 
-from visual_race_timing.annotations import load_annotations, load_notes
+from visual_race_timing.annotations import SQLiteAnnotationStore
 import iteround
 
 from visual_race_timing.loader import ImageLoader, VideoLoader
@@ -54,10 +54,10 @@ def camelize(obj):
 
 def main(args):
     # Load race configuration from yaml
-    if len(args.source) == 1 and args.source[0].is_dir():
-        loader = ImageLoader(args.source[0])
+    if len(args.sources) == 1 and args.sources[0].is_dir():
+        loader = ImageLoader(args.sources[0])
     else:
-        loader = VideoLoader(args.source)
+        loader = VideoLoader(args.sources)
     fps = loader.get_current_time().framerate
     race_config = args.project / 'config.yaml'
     with open(race_config, "r") as f:
@@ -67,8 +67,9 @@ def main(args):
     for start_name, details in starts.items():
         starts[start_name]['time'] = Timecode(fps, details['time'])
 
-    annotations = load_annotations(args.project / "annotations", loader.get_image_size())
-    notes = load_notes(args.project / "notes.tsv")
+    store = SQLiteAnnotationStore(args.project / "annotations.db")
+    annotations = store.load_all_annotations(loader.get_image_size(), "human", crossing=True)
+    notes = store.load_notes()
     frame_nums = sorted(list(annotations.keys()))
     participant_lap_times = defaultdict(list)
     crops = defaultdict(list)

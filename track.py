@@ -119,7 +119,7 @@ def run(args):
     player = VideoPlayer(args.source, True)
     player.overlay_delegate = overlay_annotations
     if args.seek_frame:
-        args.seek_time = str(Timecode(player.get_current_time().framerate, frames=args.seek_timecode_frame))
+        args.seek_time = str(Timecode(player.get_last_timecode().framerate, frames=args.seek_timecode_frame))
     if args.seek_time:
         player.seek_time(args.seek_time)
 
