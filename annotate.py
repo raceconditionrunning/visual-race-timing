@@ -166,7 +166,13 @@ def run(args):
         return True
 
     def key_delegate(frame, frame_num, key, runner_id: str = None):
-        if key == ord('`'):
+        if key == ord('\b'):
+            # Jump back 10s
+            player.seek_timecode_frame(frame_num - 10 * round(float(player.get_last_timecode().framerate)))
+        elif key == 201:  # F12, since we can't detect the delete key
+            # Jump forward 10s
+            player.seek_timecode_frame(frame_num + 10 * round(float(player.get_last_timecode().framerate)))
+        elif key == ord('`'):
             # Make a new note
             # Get runner id
             if runner_id is None:
@@ -252,8 +258,6 @@ def run(args):
                     for nearby_num in nearby_with_id:
                         store.reassign_frame_annotation(nearby_num, runner_id,
                                                                             new_annotation_id)
-
-
             player.render()
             return None
         elif key == ord('[') or key == ord(']') or key == ord('{') or key == ord('}'):
