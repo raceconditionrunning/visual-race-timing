@@ -13,7 +13,9 @@ from tqdm import tqdm
 
 from visual_race_timing.annotations import SQLiteAnnotationStore
 import iteround
+import joblib
 
+from visual_race_timing.drawing import draw_annotation
 from visual_race_timing.loader import ImageLoader, VideoLoader
 
 
@@ -68,7 +70,7 @@ def main(args):
         starts[start_name]['time'] = Timecode(fps, details['time'])
 
     store = SQLiteAnnotationStore(args.project / "annotations.db")
-    annotations = store.load_all_annotations(loader.get_image_size(), "human", crossing=True)
+    annotations = store.load_all_annotations(loader.get_image_dims(), "human", crossing=True)
     notes = store.load_notes()
     frame_nums = sorted(list(annotations.keys()))
     participant_lap_times = defaultdict(list)
@@ -82,7 +84,7 @@ def main(args):
                 participant_lap_times[runner_id].append(Timecode(fps, frames=frame_num))
                 crops[frame_num].append(
                     (runner_id, (len(participant_lap_times[runner_id])),
-                     boxes[boxes[:, 4].astype(int) == runner_id][0][:4]))
+                     boxes[boxes[:, 4].astype(int) == runner_id][0]))
 
     collated_notes = defaultdict(dict)
     for frame_num, notes_by_runner in notes.items():
@@ -97,18 +99,34 @@ def main(args):
                 participant_lap_times[runner_id] = [details['time']] + participant_lap_times[runner_id]
                 break
 
+    tracker = None
+    if args.update_tracker:
+        from visual_race_timing.tracker import PartiallySupervisedTracker
+        from types import SimpleNamespace
+        with open(args.project / "tracker_config.yaml", "r") as f:
+            tracker_config = yaml.load(f.read(), Loader=yaml.FullLoader)
+            tracker_config = SimpleNamespace(**tracker_config)  # easier dict access by dot, instead of ['']
+        tracker = PartiallySupervisedTracker(args.reid_model, tracker_config, device=args.device)
+
     if args.sources:
         frames_needing_crop = sorted(list(crops.keys()))
         crop_out_path = args.project / 'crops'
         crop_out_path.mkdir(exist_ok=True)
         for frame_num in tqdm(frames_needing_crop):
-            loader.seek_frame(frame_num)
+            loader.seek_timecode_frame(frame_num)
             path, frame, metadata = loader.__next__()
             frame = frame[0]
             for runner_id, crop_idx, crop in crops[frame_num]:
                 crop = [int(c) for c in crop]
                 to_save = frame[crop[1]:crop[3], crop[0]:crop[2]]
-                cv2.imwrite(crop_out_path / f"{runner_id}_{crop_idx}_{frame_num}.png", to_save)
+                if crop[2] - crop[0] < 24 or crop[3] - crop[1] < 24:
+                    print(f"Skipping crop {runner_id} {crop_idx} at frame {frame_num} due to small size")
+                    continue
+                if tracker:
+                    tracker.update_participant_features(frame, crop, runner_id)
+                cv2.imwrite(crop_out_path / f"{runner_id:02x}_{crop_idx}_{frame_num}.png", to_save)
+        if tracker:
+            joblib.dump(tracker, args.project / 'tracker.pkl')
 
     for runner_id, lap_start_times in participant_lap_times.items():
         runner_notes = collated_notes[format(runner_id, '02x')]
@@ -183,6 +201,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('project', type=pathlib.Path)
     parser.add_argument('--sources', type=pathlib.Path, nargs='+')
+    parser.add_argument('--update-tracker', action='store_true',)
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument("--reid-model", type=pathlib.Path, default=pathlib.Path("reid_model.pt"))
     return parser.parse_args()
 
 

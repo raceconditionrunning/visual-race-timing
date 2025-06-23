@@ -20,7 +20,6 @@ from visual_race_timing.drawing import draw_annotation
 
 from visual_race_timing.geometry import line_segment_to_box_distance
 from visual_race_timing.prompts import ask_for_id
-from visual_race_timing.tracker import get_crops, PartiallySupervisedTracker
 from visual_race_timing.media_player import VideoPlayer, PhotoPlayer, BufferedVideoPlayer
 
 from visual_race_timing.logging import get_logger
@@ -47,34 +46,7 @@ def run(args):
     if (args.project / 'tracker.pkl').is_file():
         tracker = joblib.load(args.project / 'tracker.pkl')
     else:
-        tracker = PartiallySupervisedTracker(args.reid_model, cfg, device="cuda")
-
-        # Refresh the tracker with the current participants
-        annotations = store.load_all_annotations(player.loader.get_image_dims(), "human", crossing=True)
-        frame_nums = sorted(list(annotations.keys()))
-        participant_lap_times = defaultdict(list)
-        crops = defaultdict(list)
-        for frame_num in frame_nums:
-            boxes = annotations[frame_num]['boxes']
-            crossings = annotations[frame_num]['crossings']
-            for runner_id, is_crossing in zip(boxes[:, 4], crossings):
-                runner_id = int(runner_id)
-                if is_crossing:
-                    participant_lap_times[runner_id].append(Timecode(player.loader.get_fps(), frames=frame_num))
-                    crops[frame_num].append(
-                        (runner_id, (len(participant_lap_times[runner_id])),
-                         boxes[boxes[:, 4].astype(int) == runner_id][0]))
-
-        frames_needing_crop = sorted(list(crops.keys()))
-        for frame_num in tqdm(frames_needing_crop):
-            player.loader.seek_timecode_frame(frame_num)
-            path, frame, metadata = player.loader.__next__()
-            frame = frame[0]
-            for runner_id, crop_idx, crop in crops[frame_num]:
-                crop = [int(c) for c in crop]
-                tracker.update_participant_features(frame, crop, runner_id)
-        # Reset player to initial state
-        player.seek_frame(0)
+       logger.warning(f'No tracker found, initializing from scratch.')
     # Load race configuration from yaml
     race_config = args.project / 'config.yaml'
     with open(race_config, "r") as f:
@@ -244,7 +216,8 @@ def run(args):
                     logger.info(
                         f"Unmarked {runner_id} {player.get_last_timecode()} ({player.get_last_timecode().frames}) as crossing.")
             elif key == ord('r') or key == ord("R"):
-                # Can be reassigned to anything, but null out current ID under assumption we want a different result
+                # Can be reassigned to anything, but null out current ID under the assumption we want a different result
+                # FIXME: Occasional crasher, probably when reassigning with a single box in the frame
                 emb_dists, candidate_participants = calculate_reid_distances(
                     boxes[np.where(ids == int(runner_id, 16))[0]], exclude=[int(runner_id, 16)])
                 new_annotation_id = query_for_reid(emb_dists, candidate_participants)

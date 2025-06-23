@@ -415,7 +415,7 @@ class PartiallySupervisedTracker(BOTSORT):
         return np.asarray([x.result for x in self.tracked_stracks], dtype=np.float32)
 
     def guess_id(self, frame, box):
-        crops = get_crops(box[:, :4], frame)
+        crops = get_crops(box[:, :4], frame, self.half, self.device)
         query_features = self.feature_extractor(crops).cpu().numpy()[0]
         strack_pool = self.joint_stracks(self.tracked_stracks, self.lost_stracks)
         strack_pool = self.joint_stracks(strack_pool, self.removed_stracks)
@@ -431,7 +431,7 @@ class PartiallySupervisedTracker(BOTSORT):
     def update_participant_features(self, frame, box, track_id: int):
         # One box at a time!
         box = np.atleast_2d(box)
-        crops = get_crops(box[:, :4], frame)
+        crops = get_crops(box[:, :4], frame, self.half, self.device)
         query_features = self.feature_extractor(crops).cpu().numpy()[0]
         strack_pool = self.joint_stracks(self.tracked_stracks, self.lost_stracks)
         strack_pool = self.joint_stracks(strack_pool, self.removed_stracks)
