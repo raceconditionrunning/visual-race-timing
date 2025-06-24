@@ -1,0 +1,27 @@
+[project]
+name = "visual-race-timing"
+version = "0.1.0"
+description = "Vision-assisted annotation of runners' laps"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "exif",
+    "ffmpeg-python",
+    "filterpy",
+    "gdown",
+    "iteround",
+    "joblib",
+    "lapx",
+    "numpy<2.0.0",
+    "prompt_toolkit",
+    "pyyaml",
+    "sortedcontainers",
+    "tabulate",
+    "tensorboard",
+    "timecode",
+    "torch==2.2.0",
+    "torchreid",
+    "torchvision==0.17.0",
+    "tqdm",
+    "ultralytics==8.2.0"
+]
