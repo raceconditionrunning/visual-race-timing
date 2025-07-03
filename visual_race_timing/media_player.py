@@ -52,7 +52,7 @@ class MediaPlayer:
         current_timecode = self.get_last_timecode()
 
         self.draw_active_annotation(frame)
-        render_timecode(current_timecode, frame)
+        render_timecode(current_timecode, frame, frame)
         cv2.imshow(self.window_name, self.pre_display(frame, current_timecode.frames))
 
     def mouse_callback(self, event, x, y, flags, param):
@@ -82,7 +82,7 @@ class MediaPlayer:
             # Draw the box so we can confirm
             frame = self._last_frame_img.copy()
             cv2.rectangle(frame, self.start_point, self.end_point, (0, 255, 0), 2)
-            render_timecode(self.get_last_timecode(), frame)
+            render_timecode(self.get_last_timecode(), frame, frame)
             cv2.imshow(self.window_name, frame)
             cv2.waitKey(1)
 

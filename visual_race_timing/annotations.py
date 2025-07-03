@@ -4,10 +4,7 @@ import json
 import pathlib
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
-from pathlib import Path
 import numpy as np
-import tqdm
-import ultralytics.utils
 from ultralytics.engine.results import Boxes, Keypoints
 from ultralytics.utils.ops import xywhn2xyxy
 

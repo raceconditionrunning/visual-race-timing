@@ -17,7 +17,7 @@ def get_video_metadata(video_path: pathlib.Path) -> dict:
     result = subprocess.run(
         [
             'ffprobe', '-v', 'error', '-show_entries',
-            'stream=width,height,r_frame_rate,avg_frame_rate,codec_type:stream_tags=timecode', '-of', 'json', str(video_path)
+            'stream=width,height,nb_frames,r_frame_rate,avg_frame_rate,pix_fmt,color_space,color_primaries,color_trc,color_range,codec_type:stream_tags=timecode', '-of', 'json', str(video_path)
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE

@@ -109,7 +109,7 @@ def run(args):
             if args.show:
                 img = draw_annotation(boxes.data, keypoints=keypoints.data if keypoints else None,
                                       img=r.orig_img, line_width=args.line_width, conf=boxes.conf)
-                render_timecode(start_timecode, img)
+                render_timecode(start_timecode, img, img)
                 cv2.line(img, finish_line_p0, finish_line_p1, (0, 255, 0), 2)
                 display_window.img_queue.put(img, block=False)
             if args.crop:
