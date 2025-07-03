@@ -15,7 +15,6 @@ from visual_race_timing.annotations import SQLiteAnnotationStore
 import iteround
 import joblib
 
-from visual_race_timing.drawing import draw_annotation
 from visual_race_timing.loader import ImageLoader, VideoLoader
 
 
@@ -41,6 +40,10 @@ def timecode_serializer(obj):
 def snake_to_camel(s):
     a = s.split('_')
     a[0] = a[0].lower()
+    if a[0].isnumeric():
+        # If we start with a number, it's not even a valid Javascript identifier so skip. Useful for the string
+        # mileage goal keys.
+        return s
     if len(a) > 1:
         a[1:] = [u.title() for u in a[1:]]
     return ''.join(a)
@@ -74,6 +77,7 @@ def main(args):
     notes = store.load_notes()
     frame_nums = sorted(list(annotations.keys()))
     participant_lap_times = defaultdict(list)
+
     crops = defaultdict(list)
     for frame_num in frame_nums:
         boxes = annotations[frame_num]['boxes']
@@ -94,10 +98,15 @@ def main(args):
     # Insert start time at start of lap time list depending on bib
     for runner_id in participant_lap_times.keys():
         for start_name, details in starts.items():
-            bib_range = details['bibs']
-            if bib_range[0] <= runner_id < bib_range[1]:
-                participant_lap_times[runner_id] = [details['time']] + participant_lap_times[runner_id]
-                break
+            if 'bib_range' in details:
+                bib_range = details['bib_range']
+                if bib_range[0] <= runner_id < bib_range[1]:
+                    participant_lap_times[runner_id] = [details['time']] + participant_lap_times[runner_id]
+                    break
+            elif "bibs" in details:
+                if runner_id in details['bibs']:
+                    participant_lap_times[runner_id] = [details['time']] + participant_lap_times[runner_id]
+                    break
 
     tracker = None
     if args.update_tracker:
@@ -108,7 +117,7 @@ def main(args):
             tracker_config = SimpleNamespace(**tracker_config)  # easier dict access by dot, instead of ['']
         tracker = PartiallySupervisedTracker(args.reid_model, tracker_config, device=args.device)
 
-    if args.sources:
+    if args.crops or args.update_tracker:
         frames_needing_crop = sorted(list(crops.keys()))
         crop_out_path = args.project / 'crops'
         crop_out_path.mkdir(exist_ok=True)
@@ -127,13 +136,13 @@ def main(args):
                 cv2.imwrite(crop_out_path / f"{runner_id:02x}_{crop_idx}_{frame_num}.png", to_save)
         if tracker:
             joblib.dump(tracker, args.project / 'tracker.pkl')
-
+    report = ""
     for runner_id, lap_start_times in participant_lap_times.items():
         runner_notes = collated_notes[format(runner_id, '02x')]
         if runner_id not in race_config['participants']:
             continue
         # list has two extra entries: start time, and 1st lap entrance (which is not a full lap)
-        print(f"{race_config['participants'][runner_id]} ({runner_id}): {len(lap_start_times) - 2} laps")
+        report += f"{race_config['participants'][runner_id]} ({runner_id:02x}): {len(lap_start_times) - 2} laps\n"
         lap_table = []
         lap_time = [lap_start_times[i].to_realtime(as_float=True) - lap_start_times[i - 1].to_realtime(
             as_float=True) if i > 0 else 0 for i in
@@ -151,11 +160,19 @@ def main(args):
         note_insertion_indices = np.searchsorted(np.array([entry[2] for entry in lap_table]), note_frames)
         # Check laps which take 70-120% longer than the previous lap. Add a warning label, unless there's a note already there.
         # We skip first (start time) and second (course entrance, not a full lap).
+        # Also check lap times which are in second standard deviation of the lap times. We calculate these stats with
+        # only the [0, 90th] percentiles of lap times, to throw out walking laps
+        max_percentile = np.percentile(lap_time, 90)
+        less_than_max = [t for t in lap_time if t < max_percentile]
+        lap_mean = np.mean(less_than_max)
+        lap_sd = np.std(less_than_max)
         for i in range(3, len(lap_time)):
             ratio = lap_time[i] / lap_time[i - 1]
             if 2.2 >= ratio >= 1.7 and i not in note_insertion_indices:
-                runner_notes[lap_start_times[i].frames] = f"Warning: Lap time is {ratio:.2f}x the previous lap"
-
+                previous_lap_frame_length = lap_start_times[i - 1].frames - lap_start_times[i - 2].frames
+                runner_notes[lap_start_times[i - 1].frames + previous_lap_frame_length] = f"Warning: Lap time is {ratio:.2f}x the previous lap"
+            if (lap_time[i] < lap_mean - 2. * lap_sd) or (lap_time[i] < .5 * lap_mean) and i not in note_insertion_indices:
+                runner_notes[lap_start_times[i].frames] = f"Warning: Lap time is unusually fast"
         note_frames = sorted(list(runner_notes.keys()))
         for j, note_frame in enumerate(note_frames):
             note = runner_notes[note_frame]
@@ -165,15 +182,17 @@ def main(args):
                              [f"Note: {j}", str(Timecode(fps, frames=int(note_frame))), int(note_frame), None, None,
                               note])
 
-        print(tabulate.tabulate(lap_table,
+        report += tabulate.tabulate(lap_table,
                                 headers=['Lap', 'Start Time', 'Start Frame', 'Lap Time', 'Lap Time Change', 'Notes'],
-                                floatfmt=".2f"))
+                                floatfmt=".2f") + "\n\n"
 
     # count all laps
     all_laps = 0
     for runner_id, lap_times in participant_lap_times.items():
         all_laps += len(lap_times)
-    print(f"Total laps: {all_laps}")
+    report += f"Total laps: {all_laps}"
+    with open(args.project / "report.txt", "w") as f:
+        f.write(report)
 
     output = {"config": race_config, "results": []}
 
@@ -204,6 +223,9 @@ def parse_args():
     parser.add_argument('--update-tracker', action='store_true',)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument("--reid-model", type=pathlib.Path, default=pathlib.Path("reid_model.pt"))
+    parser.add_argument('--crops', action='store_true',
+                        help="Crop images of participants at the start of each lap and save them to the project/crops "
+                             "directory.")
     return parser.parse_args()
 
 
