@@ -19,6 +19,8 @@ def run(args):
         loader = ImageLoader(args.source[0])
         is_10bit = False
         pix_fmt = "rgb24"
+        vid_metadata = {'color_space': 'bt709'}
+        frame_rate = "30"  # Images are assumed to be some slightly variable low fps, which we'll retarget below
     else:
         # First detect if we need 10-bit processing
         vid_metadata = get_video_metadata(args.source[0])['streams'][0]
@@ -33,6 +35,7 @@ def run(args):
             # Use standard OpenCV-based loader for 8-bit videos
             logger.info("Using standard video loader for 8-bit processing")
             loader = VideoLoader(args.source)
+        frame_rate = str(loader.get_current_time().framerate)
 
     end_tc = None
     if args.range:
@@ -60,24 +63,31 @@ def run(args):
         convert_to_16bit = False
         logger.info("Using 8-bit encoding pipeline")
 
+    if args.output.is_file():
+        logger.error(f"Output file {args.output} already exists. Please specify a new output file.")
+        exit(1)
+
     ffmpeg_cmd = [
                      'ffmpeg',
-                     '-y',  # Overwrite output file
                      '-f', 'rawvideo',
                      '-vcodec', 'rawvideo',
                      '-s', f'{width}x{height}',  # Frame size
                      '-pix_fmt', input_pix_fmt,
-                     '-r', str(loader.get_current_time().framerate),  # Frame rate
+                     '-r', frame_rate,  # Frame rate
                      '-i', '-',  # Read from stdin
                      '-c:v', args.codec,  # Video codec
                  ] + profile_args + [  # Add profile for 10-bit if needed
                      '-preset', args.preset,  # Encoding preset
                      '-crf', str(args.crf),  # Quality setting
                      '-pix_fmt', output_pix_fmt,
-                    '-tag:v', 'hvc1',  # QuickTime-compatible HEVC tag
-                    '-color_primaries', vid_metadata.get('color_primaries', 'bt709'),  # Default to 'bt709' if not specified
-                    '-colorspace', vid_metadata['color_space'],
-                        '-color_range', vid_metadata.get('color_range', 'tv'),  # Default to 'tv' if not specified
+        '-tag:v', 'hvc1',  # QuickTime-compatible HEVC tag
+        '-color_primaries', vid_metadata.get('color_primaries', 'bt709'),
+        # Default to 'bt709' if not specified
+        '-colorspace', vid_metadata['color_space'],
+        '-color_range', vid_metadata.get('color_range', 'tv'),  # Default to 'tv' if not specified
+        '-timecode', str(Timecode(frame_rate, start_seconds=loader.get_current_time().float)),
+        '-movflags', '+faststart',
+        # Set start timecode
 
                      str(args.output)
                  ]
@@ -94,18 +104,28 @@ def run(args):
         )
 
         frame_count = 0
+        duplicated_frames = 0
         for path, frames, metadata in tqdm.tqdm(loader):
             timecode = metadata[0][0]
             if end_tc and timecode >= end_tc:
                 break
 
             out = render_timecode_pil(metadata[0][0], frames[0])
-            #import cv2
-            #cv2.imshow('frame', (np.array(out/257).astype(np.uint8)))
+            # import cv2
+            # cv2.imshow('frame', (np.array(out/257).astype(np.uint8)))
 
-            #cv2.waitKey(1)  # Display the frame for a brief moment
+            # cv2.waitKey(1)  # Display the frame for a brief moment
             try:
                 ffmpeg_process.stdin.write(out.tobytes())
+                # Retarget the frame rate to match the desired output frame rate
+                current_frame_timecode = Timecode(frame_rate, start_seconds=timecode.float)
+                next_frame_timecode = loader.get_current_time()
+                while next_frame_timecode and next_frame_timecode.float > (current_frame_timecode + 1).float:
+                    # We need to duplicate frames to match the frame rate
+                    duplicated_frames += 1
+                    ffmpeg_process.stdin.write(out.tobytes())
+                    current_frame_timecode += 1
+
                 frame_count += 1
 
 
@@ -121,7 +141,8 @@ def run(args):
         return_code = ffmpeg_process.wait()
 
         if return_code == 0:
-            logger.info(f"Successfully encoded {frame_count} frames to {args.output}")
+            logger.info(
+                f"Successfully encoded {frame_count} frames to {args.output} (with {duplicated_frames} duplicated frames)")
         else:
             logger.error(f"FFmpeg failed with return code {return_code}")
             logger.error(f"FFmpeg stderr: {stderr_output}")
