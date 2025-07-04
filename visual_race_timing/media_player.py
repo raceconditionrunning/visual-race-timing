@@ -331,7 +331,7 @@ class PhotoPlayer(MediaPlayer):
         self.loader = ImageLoader(frame_directory)
         super().__init__(paused)
         self.index = 0
-        self.current_frame_timecode = None
+        self._last_frame_timecode = None
 
     def seek_time(self, time_str: str) -> bool:
         # Check if includes frame number (HH:MM:SS:FF), if not add :00
@@ -343,7 +343,7 @@ class PhotoPlayer(MediaPlayer):
         return self.loader.seek_timecode(timecode)
 
     def get_last_timecode(self):
-        return self.current_frame_timecode
+        return self._last_frame_timecode
 
     def _advance_frame(self):
         path, frame, metadata = self.loader.__next__()

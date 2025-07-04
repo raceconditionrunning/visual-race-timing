@@ -4,8 +4,9 @@ import math
 import pathlib
 import os
 import subprocess
-from typing import List
+from typing import List, Optional
 
+import csv
 import cv2
 import exif
 import numpy as np
@@ -39,10 +40,10 @@ class Loader:
     def get_image_size(self):
         return tuple(reversed(self.get_image_dims()))
 
-    def get_current_time(self) -> Timecode:
+    def get_current_time(self) -> Optional[Timecode]:
         raise NotImplementedError("get_current_time must be implemented by subclass")
 
-    def get_current_frame(self) -> int:
+    def get_current_frame(self) -> Optional[int]:
         raise NotImplementedError("get_current_frame must be implemented by subclass")
 
     def seek_timecode(self, timecode: Timecode) -> bool:
@@ -61,17 +62,11 @@ class Loader:
 class ImageLoader(Loader):
     def __init__(self, frame_directory, batch=1, crop=None):
         super().__init__(frame_directory, batch, crop=crop)
-        if (frame_directory / "timecode_index").is_dir():
-            self.time_to_path = load_timecode_index(frame_directory / "timecode_index")
+        if (frame_directory / "index.tsv").is_file():
+            self.time_to_path = load_timecode_index(frame_directory / "index.tsv")
         else:
-            frame_times = get_capture_times_from_exif(frame_directory)
-            (frame_directory / "timecode_index").mkdir()
-            self.time_to_path = create_timecode_symlinks(frame_times, (frame_directory / "timecode_index"))
-            # Get seconds from start of day
-            first_frame_date = list(self.time_to_path.keys())[0]
-            first_frame_time = first_frame_date - datetime.datetime(first_frame_date.year, first_frame_date.month,
-                                                                    first_frame_date.day)
-            self.start_timecode = Timecode(1000, start_seconds=first_frame_time.total_seconds())
+            self.time_to_path = get_capture_times_from_exif(frame_directory)
+            create_timecode_index(self.time_to_path, (frame_directory / "index.tsv"))
 
         first_frame_date = list(self.time_to_path.keys())[0]
         self.files = list(self.time_to_path.values())
@@ -110,10 +105,14 @@ class ImageLoader(Loader):
     def get_image_dims(self):
         return self._source_dims[0]
 
-    def get_current_time(self) -> Timecode:
+    def get_current_time(self) -> Optional[Timecode]:
+        if self.source_index >= len(self._timecodes):
+            return None
         return self._timecodes[self.source_index]
 
-    def get_current_frame(self) -> int:
+    def get_current_frame(self) -> Optional[int]:
+        if self.source_index >= len(self._timecodes):
+            return None
         return self.source_index
 
     def seek_timecode_frame(self, target_frame: int):
@@ -152,6 +151,7 @@ class VideoLoader(Loader):
         assert all([timecode.framerate == self._timecodes[0].framerate for timecode in self._timecodes]), \
             "All videos must have the same framerate"
         self.fps = self._timecodes[0].framerate  # Framerate of the first video
+        self._rotation = get_video_metadata(paths[0])["streams"][0].get("side_data_list", [{}])[0].get("rotation", 0)
         self._frame_lengths = [int(cv2.VideoCapture(source).get(cv2.CAP_PROP_FRAME_COUNT)) for source in paths]
         end_timecodes = [timecode + frame_length for timecode, frame_length in
                          zip(self._timecodes, self._frame_lengths)]
@@ -224,6 +224,14 @@ class VideoLoader(Loader):
 
                 success, im0 = self.cap.retrieve()
                 if success:
+                    if self._rotation != 0:
+                        # Rotate the image if needed
+                        if self._rotation == 90:
+                            im0 = cv2.rotate(im0, cv2.ROTATE_90_CLOCKWISE)
+                        elif self._rotation == 180 or self._rotation == -180:
+                            im0 = cv2.rotate(im0, cv2.ROTATE_180)
+                        elif self._rotation == 270 or self._rotation == -90:
+                            im0 = cv2.rotate(im0, cv2.ROTATE_90_COUNTERCLOCKWISE)
                     frame_timecode = Timecode(self.get_fps(), frames=self._timecodes[0].frames) + self._current_frame
                     paths.append(path)
                     # NOTE: Because the cap won't increment past the last frame of the video, the source_frame counter won't increment when retrieving the last frame.
@@ -262,15 +270,19 @@ class VideoLoader(Loader):
     def get_fps(self) -> str:
         return self.fps
 
-    def get_current_time(self) -> Timecode:
+    def get_current_time(self) -> Optional[Timecode]:
         """ Returns the timecode that would be returned by the next call to __next__. Includes real frames and gaps."""
+        if self.source_index >= len(self._timecodes):
+            return None
         # Note that this requires gaps to have been accounted for in the current frame calculation
         return self._timecodes[0] + self.get_current_frame()
 
-    def get_current_frame(self) -> int:
+    def get_current_frame(self) -> Optional[int]:
         """
         Returns the index of the frame that would be returned by the next call to __next__. This counter increments and includes real frames and gaps.
         """
+        if self.source_index >= len(self._timecodes):
+            return None
         return self._current_frame
 
     def seek_time(self, time_str: str) -> bool:
@@ -378,6 +390,8 @@ class FFmpegVideoLoader(Loader):
             "All videos must have the same framerate"
 
         self.fps = self._timecodes[0].framerate
+        self._rotation = get_video_metadata(video_paths[0])["streams"][0].get("side_data_list", [{}])[0].get("rotation",
+                                                                                                             0)
         self.vid_stride = vid_stride
 
         # Get video info and frame lengths
@@ -459,11 +473,11 @@ class FFmpegVideoLoader(Loader):
 
         self._source_frame = start_frame
 
-    def get_current_time(self):
+    def get_current_time(self) -> Timecode:
         """Return current timecode (compatible with existing interface)"""
         return self._timecodes[0] + self._current_frame
 
-    def get_current_frame(self):
+    def get_current_frame(self) -> int:
         """Returns the index of the frame that would be returned by the next call to __next__"""
         return self._current_frame
 
@@ -531,6 +545,14 @@ class FFmpegVideoLoader(Loader):
 
         # Create cv::Mat from numpy array
         frame = cv2.Mat(frame_np)
+        if self._rotation != 0:
+            # Rotate the image if needed
+            if self._rotation == 90:
+                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            elif self._rotation == 180 or self._rotation == -180:
+                frame = cv2.rotate(frame, cv2.ROTATE_180)
+            elif self._rotation == 270 or self._rotation == -90:
+                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
         # Convert RGB to BGR
         #frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -590,7 +612,8 @@ class FFmpegVideoLoader(Loader):
                     # This is a gap frame - use last frame of current source
                     if self._source_frame < self._frame_lengths[self.source_index]:
                         # Need to read remaining frames to get to the end
-                        while self._source_frame <= self._frame_lengths[self.source_index]:
+                        while self.source_index < len(self.files) and self._source_frame <= self._frame_lengths[
+                            self.source_index]:
                             success, frame = self._read_frame()
                             if not success:
                                 break
@@ -649,7 +672,7 @@ class FFmpegVideoLoader(Loader):
             self.ffmpeg_process.terminate()
 
 def get_capture_times_from_exif(jpg_directory: pathlib.Path) -> SortedDict:
-    frame_times = SortedDict()
+    time_to_path = SortedDict()
     # Iterate through the .jpg files in the directory
     for image_path in tqdm(jpg_directory.glob("*.jpg")):
         image_path = image_path.resolve()
@@ -660,30 +683,25 @@ def get_capture_times_from_exif(jpg_directory: pathlib.Path) -> SortedDict:
 
             capture_time = datetime.datetime.strptime(image["datetime_original"] + ":" + image["subsec_time_original"],
                                                       "%Y:%m:%d %H:%M:%S:%f")
-            frame_times[image_path] = capture_time
+            time_to_path[capture_time] = image_path
         except (OSError, KeyError, AttributeError) as e:
             # Handle any exceptions while processing the image
             print(f"Error processing image: {image_path}")
             print(e)
-    return frame_times
+    return time_to_path
 
 
 def load_timecode_index(timecode_index: pathlib.Path):
-    files = os.listdir(timecode_index)
-    time_frame_paths = SortedDict()
-    for file in files:
-        # Remove extension
-        date_part = ".".join(file.split(".")[:-1])
-        time = datetime.datetime.strptime(date_part, "%Y-%m-%d_%H:%M:%S.%f")
-        time_frame_paths[time] = (timecode_index / file).resolve()
-    return time_frame_paths
+    # Write this to a file so it's faster to load next time
+    with open(timecode_index, "r") as f:
+        return SortedDict(
+            {datetime.datetime.fromisoformat(row[0]): pathlib.Path(row[1]) for row in csv.reader(f, delimiter="\t")})
 
 
-def create_timecode_symlinks(frames_by_time: SortedDict, out_dir: pathlib.Path):
+def create_timecode_index(frames_by_time: SortedDict, out_path: pathlib.Path):
     # Make the capture time the filename
-    time_frame_paths = SortedDict()
-    for i, (frame_path, capture_time) in tqdm(enumerate(frames_by_time.items())):
-        link_path = out_dir / capture_time.strftime('%Y-%m-%d_%H:%M:%S.%f')
-        os.system(f"ln -s {frame_path} {link_path}")
-        time_frame_paths[capture_time] = link_path
-    return time_frame_paths
+    with open(out_path, "w") as f:
+        writer = csv.writer(f, delimiter="\t")
+        for time, path in frames_by_time.items():
+            # Write the time in ISO format and the path
+            writer.writerow([time.isoformat(timespec='milliseconds'), str(path)])

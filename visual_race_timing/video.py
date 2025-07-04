@@ -6,6 +6,9 @@ from typing import Optional, Tuple, List
 from joblib import Memory
 from timecode import Timecode
 
+from .logging import get_logger
+
+logger = get_logger(__name__)
 # Create joblib memory cache
 CACHE_DIR = ".cache"
 memory = Memory(str(CACHE_DIR), verbose=0)
@@ -14,14 +17,17 @@ memory = Memory(str(CACHE_DIR), verbose=0)
 @memory.cache
 def get_video_metadata(video_path: pathlib.Path) -> dict:
     # Run ffprobe to get the metadata
+    cmd = [
+        'ffprobe', '-v', 'error', '-show_entries', 'stream_side_data=rotation', '-show_entries',
+        'stream=width,height,nb_frames,r_frame_rate,avg_frame_rate,pix_fmt,color_space,color_primaries,color_trc,color_range,codec_type:stream_tags=timecode',
+        '-of', 'json', str(video_path)
+    ]
     result = subprocess.run(
-        [
-            'ffprobe', '-v', 'error', '-show_entries',
-            'stream=width,height,nb_frames,r_frame_rate,avg_frame_rate,pix_fmt,color_space,color_primaries,color_trc,color_range,codec_type:stream_tags=timecode', '-of', 'json', str(video_path)
-        ],
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE
     )
+    logger.debug(f"Running command: {'  '.join(cmd)}")
 
     # Parse the JSON output
     data = json.loads(result.stdout)

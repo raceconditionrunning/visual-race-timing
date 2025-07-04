@@ -304,7 +304,7 @@ class SQLiteAnnotationStore:
 
         return annotations
 
-    def save_notes(self, notes: Dict[int, Dict[str, str]]):
+    def save_notes(self, notes: Dict[int, Dict[int, str]]):
         """Save notes to database"""
         with sqlite3.connect(self.db_path) as conn:
             # Clear existing notes
