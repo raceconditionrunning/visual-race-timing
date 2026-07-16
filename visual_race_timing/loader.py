@@ -177,7 +177,7 @@ class VideoLoader(Loader):
         self._source_frame = 0
         # How many gap frames we have already skipped in the current source
         self.gap_offset = 0
-        self.frames_to_stride = self.bs
+        self.frames_to_stride = self.vid_stride
 
     def __next__(self):
         """Returns the next batch of images along with their paths and metadata."""
@@ -429,7 +429,7 @@ class FFmpegVideoLoader(Loader):
         self._current_frame = 0  # Index across all sources
         self._source_frame = 0  # Index into current video source
         self.gap_offset = 0  # Gap frames skipped in current source
-        self.frames_to_stride = batch
+        self.frames_to_stride = vid_stride
 
         self.ffmpeg_process = None
         self._start_current_video()
@@ -588,7 +588,7 @@ class FFmpegVideoLoader(Loader):
 
         paths, imgs, info = [], [], []
 
-        while len(imgs) < self.frames_to_stride:
+        while len(imgs) < self.bs:
             if self.source_index >= self.num_sources:
                 if len(imgs) > 0:
                     return paths, imgs, info
@@ -677,13 +677,13 @@ class FFmpegVideoLoader(Loader):
     def __len__(self):
         """Returns the total number of batches in the object"""
         total_frames = sum(self._frame_lengths) + sum(self.gaps)
-        return math.ceil(total_frames / self.frames_to_stride)
+        return math.ceil(total_frames / self.bs)
 
     @property
     def remaining_batches(self):
         """Returns the number of batches remaining, accounting for any seek."""
         total_frames = sum(self._frame_lengths) + sum(self.gaps)
-        return math.ceil(max(total_frames - self._current_frame, 0) / self.frames_to_stride)
+        return math.ceil(max(total_frames - self._current_frame, 0) / self.bs)
 
     def __del__(self):
         """Cleanup FFmpeg process"""
