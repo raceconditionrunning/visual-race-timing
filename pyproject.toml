@@ -19,6 +19,10 @@ dependencies = [
     "ultralytics==8.4.93",
 ]
 
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [tool.setuptools.packages.find]
-include = ["visual_race_timing*"]
-exclude = ["data*", "vendor*", "scripts*"]
+include = ["visual_race_timing*", "scripts*"]
+exclude = ["data*", "vendor*"]

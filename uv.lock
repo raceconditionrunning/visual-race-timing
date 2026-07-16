@@ -1385,7 +1385,7 @@ wheels = [
 [[package]]
 name = "visual-race-timing"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "boxmot" },
     { name = "exif" },

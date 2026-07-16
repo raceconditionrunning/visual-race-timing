@@ -1,2 +1,8 @@
 data
 *.pt
+
+# Python files.
+**/__pycache__
+
+# Build artifacts and metadata.
+*egg-info/
