@@ -30,6 +30,25 @@ class MediaPlayer:
         self.window_name = 'Edit Race Annotations'
         self.crop = crop
 
+    def _crop_for_display(self, frame):
+        """Crop a full-resolution frame down to the display area, if --crop is set.
+
+        crop is (w, h, x, y), matching detect.py/VideoLoader's ffmpeg-style
+        convention. Applied only at the very end of rendering so annotation
+        overlays and click coordinates keep working in full-frame space.
+        """
+        if self.crop:
+            w, h, x, y = self.crop
+            return frame[y:y + h, x:x + w]
+        return frame
+
+    def _to_frame_point(self, x, y):
+        """Translate a point from the (possibly cropped) display window back to full-frame coordinates."""
+        if self.crop:
+            _, _, cx, cy = self.crop
+            return x + cx, y + cy
+        return x, y
+
     def get_last_timecode(self) -> Timecode:
         """ Return the timecode of the last frame displayed. Returns None if no frame has been displayed. """
         raise NotImplementedError("get_current_time must be implemented by subclass")
@@ -53,26 +72,29 @@ class MediaPlayer:
 
         self.draw_active_annotation(frame)
         render_timecode(current_timecode, frame, frame)
-        if self.crop:
-            # Crop the frame if crop is enabled
-            # FIXME: Need to update the pre-display API to accept information about the crop
-            frame = frame[self.crop[1]:self.crop[1] + self.crop[3], self.crop[0]:self.crop[0] + self.crop[2]]
-        cv2.imshow(self.window_name, self.pre_display(frame, current_timecode.frames))
+        # pre_display (e.g. annotation overlays) needs the full frame, since
+        # stored annotations are normalized against the uncropped frame size.
+        display_frame = self.pre_display(frame, current_timecode.frames)
+        cv2.imshow(self.window_name, self._crop_for_display(display_frame))
 
     def mouse_callback(self, event, x, y, flags, param):
         if not self.paused:
             return
+        # Mouse coordinates are relative to the (possibly cropped) display
+        # window; translate them back to full-frame coordinates before using
+        # them, since annotations/clicks are handled in full-frame space.
         if event == cv2.EVENT_LBUTTONUP:
-            result = self.click_delegate(self._last_frame_img, self.get_last_timecode().frames, (x, y), flags)
+            click_pt = self._to_frame_point(x, y)
+            result = self.click_delegate(self._last_frame_img, self.get_last_timecode().frames, click_pt, flags)
             self.render()
             return
         if event == cv2.EVENT_RBUTTONDOWN:
-            self.start_point = (x, y)
+            self.start_point = self._to_frame_point(x, y)
             dotted = self._last_frame_img.copy()
             cv2.circle(dotted, self.start_point, 5, (0, 255, 0), -1)
-            cv2.imshow(self.window_name, dotted)
+            cv2.imshow(self.window_name, self._crop_for_display(dotted))
         elif event == cv2.EVENT_RBUTTONUP:
-            self.end_point = (x, y)
+            self.end_point = self._to_frame_point(x, y)
             # ignore small boxes
             if abs(self.start_point[0] - self.end_point[0]) < 10 or abs(self.start_point[1] - self.end_point[1]) < 10:
                 self.start_point = None
@@ -87,12 +109,7 @@ class MediaPlayer:
             frame = self._last_frame_img.copy()
             cv2.rectangle(frame, self.start_point, self.end_point, (0, 255, 0), 2)
             render_timecode(self.get_last_timecode(), frame, frame)
-            if self.crop:
-                # Crop the frame if crop is enabled
-                cv2.imshow(frame[self.crop[1]:self.crop[1] + self.crop[3], self.crop[0]:self.crop[0] + self.crop[2]],
-                           frame)
-            else:
-                cv2.imshow(self.window_name, frame)
+            cv2.imshow(self.window_name, self._crop_for_display(frame))
             cv2.waitKey(1)
 
             try:
@@ -350,8 +367,12 @@ class DisplayWindow:
 
 class PhotoPlayer(MediaPlayer):
     def __init__(self, frame_directory, paused=False, **kwargs):
+        # crop is display-only (see MediaPlayer._crop_for_display), so it must not
+        # reach ImageLoader: baking it into the decoded frame would break annotation
+        # overlay math, which assumes frame.shape matches the uncropped image.
+        crop = kwargs.pop('crop', None)
         self.loader = ImageLoader(frame_directory, **kwargs)
-        super().__init__(paused)
+        super().__init__(paused, crop=crop)
         self.index = 0
         self._last_frame_timecode = None
 

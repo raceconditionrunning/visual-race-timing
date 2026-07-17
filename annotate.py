@@ -31,7 +31,7 @@ logger = get_logger(__name__)
 
 def run(args):
     if len(args.source) == 1 and args.source[0].is_dir():
-        player = PhotoPlayer(args.source[0], args.paused)
+        player = PhotoPlayer(args.source[0], args.paused, crop=args.crop)
     else:
         player = BufferedVideoPlayer(args.source, args.paused, crop=args.crop)
 
@@ -495,7 +495,7 @@ def parse_opt():
                         help='device to run on, e.g. cuda, 0, 0,1,2,3, cpu, or mps (Apple Silicon)')
     parser.add_argument('--detection-model', type=str, default='detection',
                         help='Only display detections from this source')
-    parser.add_argument('--crop', type=int, nargs=4, default=None, help="display area x y w h")
+    parser.add_argument('--crop', type=int, nargs=4, default=None, help="display area w h x y")
 
     opt = parser.parse_args()
 
