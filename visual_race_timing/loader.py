@@ -315,6 +315,10 @@ class VideoLoader(Loader):
         """Creates a new video capture object for the given path."""
         self._source_frame = 0
         self.cap = cv2.VideoCapture(path)
+        # Some OpenCV builds auto-apply rotation side-data before frames reach Python. Disable it so
+        # decode behavior (and frame dims vs. self._source_dims) doesn't depend on the
+        # installed OpenCV version.
+        self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
         # Try to preserve native format. Unfortunately, we can't read yuv420p10le directly with OpenCV, so these won't work.
         #self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)  # Don't convert to RGB
         #self.cap.set(cv2.CAP_PROP_FORMAT, cv2.CV_16UC3)  # Request 16-bit format
