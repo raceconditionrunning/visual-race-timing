@@ -15,6 +15,7 @@ from ultralytics.utils.metrics import bbox_ioa
 
 from visual_race_timing.annotations import SQLiteAnnotationStore
 from visual_race_timing.drawing import draw_annotation
+from visual_race_timing.proxy import find_proxy
 from visual_race_timing.reid_bank import DEFAULT_REID_WEIGHTS, ReIDBank, available_reid_models, build_extractor
 from visual_race_timing.race_config import build_start_realtime, get_finish_line
 from visual_race_timing.timing_prior import TimingPrior, fuse_ranking
@@ -29,11 +30,37 @@ from visual_race_timing.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _shift_to_local(boxes, kpts, offset_x, offset_y):
+    """Shift xyxy boxes (cols 0:4) and keypoints (cols 0,1) from full-frame
+    coordinates into a frame offset by (offset_x, offset_y)."""
+    if offset_x or offset_y:
+        if boxes.size > 0:
+            boxes[:, [0, 2]] -= offset_x
+            boxes[:, [1, 3]] -= offset_y
+        if kpts is not None:
+            kpts[:, :, 0] -= offset_x
+            kpts[:, :, 1] -= offset_y
+    return boxes, kpts
+
+
 def run(args):
-    if len(args.source) == 1 and args.source[0].is_dir():
+    is_photo_source = len(args.source) == 1 and args.source[0].is_dir()
+
+    sources = args.source
+    proxy_kwargs = {}
+    if args.crop and not is_photo_source:
+        proxies = [find_proxy(s, args.crop, 1.0) for s in args.source]
+        if all(proxies):
+            sources = proxies
+            proxy_kwargs = {'original_sources': args.source}
+            logger.info(f"Using proxy media for crop {args.crop}.")
+        else:
+            logger.info("No matching proxy for one or more sources, decoding originals.")
+
+    if is_photo_source:
         player = PhotoPlayer(args.source[0], args.paused, crop=args.crop)
     else:
-        player = BufferedVideoPlayer(args.source, args.paused, crop=args.crop)
+        player = BufferedVideoPlayer(sources, args.paused, crop=args.crop, **proxy_kwargs)
 
     # Load all annotations
     store = SQLiteAnnotationStore(args.project / 'annotations.db')
@@ -73,11 +100,20 @@ def run(args):
         player.seek_time(args.seek_time)
 
     def overlay_annotations(frame, frame_num):
+        # Denormalize against the loader's original dims, not frame.shape,
+        # then shift into frame's own (possibly offset) pixel space.
+        original_dims = player.loader.get_image_dims()
+        offset_x, offset_y = player.frame_offset()
+
         frame_notes = store.get_notes(frame_num)
         frame_annotation_boxes, frame_annotation_keypoints, frame_annotation_crossings, _ = store.get_frame_annotation(
-            frame_num, frame.shape[:2], "human")
+            frame_num, original_dims, "human")
         frame_detection_boxes, frame_detection_keypoints, frame_detection_crossings, _ = store.get_frame_annotation(
-            frame_num, frame.shape[:2], args.detection_model)
+            frame_num, original_dims, args.detection_model)
+        frame_annotation_boxes, frame_annotation_keypoints = _shift_to_local(
+            frame_annotation_boxes, frame_annotation_keypoints, offset_x, offset_y)
+        frame_detection_boxes, frame_detection_keypoints = _shift_to_local(
+            frame_detection_boxes, frame_detection_keypoints, offset_x, offset_y)
 
         if frame_detection_boxes.size > 0:
             frame = draw_annotation(img=frame, boxes=frame_detection_boxes, keypoints=frame_detection_keypoints,
@@ -109,7 +145,9 @@ def run(args):
             logger.info("Box too small, ignoring.")
             return False
         else:
-            bank.update(player._last_frame_img, new_box, runner_id)
+            # new_box is in full-frame coords; shift to match _last_frame_img.
+            local_box, _ = _shift_to_local(new_box.copy(), None, *player.frame_offset())
+            bank.update(player._last_frame_img, local_box, runner_id)
         return True
 
     # --- Timing prior -------------------------------------------------------
@@ -141,7 +179,9 @@ def run(args):
 
     def calculate_reid_distances(box, exclude: List[int] = [], timecode=None, crossing=False):
         new_box = np.atleast_2d(box)
-        candidate_participants, emb_dists = bank.guess(player._last_frame_img, new_box)
+        # box is in full-frame coords; shift to match _last_frame_img.
+        local_box, _ = _shift_to_local(new_box.copy(), None, *player.frame_offset())
+        candidate_participants, emb_dists = bank.guess(player._last_frame_img, local_box)
 
         # Drop excluded ids, then return (distances, ids) ranked closest-first.
         paired = [(d, i) for d, i in zip(emb_dists, candidate_participants) if i not in exclude]
@@ -182,7 +222,8 @@ def run(args):
             else:
                 update_tracker(new_box, int(annotation_id, 16))
         new_box[:, 4] = int(annotation_id, 16)
-        store.update_annotation(timecode.frames, Boxes(new_box, player._last_frame_img.shape[:2]), None,
+        # new_box is in full-frame coords; normalize against original dims.
+        store.update_annotation(timecode.frames, Boxes(new_box, player.loader.get_image_dims()), None,
                                 [crossing], "human")
         if crossing:
             # New crossing labeled -> the timing prior's history is now stale.
@@ -233,7 +274,8 @@ def run(args):
                 return None
             return None
         elif key == ord('d') or key == ord('c') or key == ord('D') or key == ord('r') or key == ord("R"):
-            annotation = store.get_frame_annotation(frame_num, frame.shape[:2], source="human")
+            # 'r'/'R' pass these to calculate_reid_distances, which expects full-frame coords.
+            annotation = store.get_frame_annotation(frame_num, player.loader.get_image_dims(), source="human")
             boxes = annotation[0]
             ids = boxes[:, 4].astype(int)
             bibs = [format(runner_id, '02x') for runner_id in ids]
@@ -311,7 +353,8 @@ def run(args):
         elif key == ord('9') or key == ord('0'):
             # Seek to line detection
             fps = player.get_last_timecode().framerate
-            frame_h, frame_w = frame.shape[:2]
+            # Scans normalized annotations across many frames, so use original dims.
+            frame_h, frame_w = player.loader.get_image_dims()
             previous = key == ord('9')
 
             def on_line(x):
@@ -420,10 +463,12 @@ def run(args):
         return None
 
     def click_delegate(frame, frame_num, click_pt, flags):
+        # click_pt is in full-frame coords; denormalize boxes to match.
+        original_w, original_h = player.loader.get_image_dims()[::-1]
         # First, check if user clicked on any existing boxes
         frame_annotations = store.get_frame_annotation(frame_num, source="human")
         boxes = frame_annotations[0]
-        boxes[:, :4] = ultralytics.utils.ops.xywhn2xyxy(boxes[:, :4], *frame.shape[1::-1])
+        boxes[:, :4] = ultralytics.utils.ops.xywhn2xyxy(boxes[:, :4], original_w, original_h)
         # Check if the click point is inside any of the boxes
         inside = [box[0] < click_pt[0] < box[2] and box[1] < click_pt[1] < box[3] for box in boxes]
         if len(inside) == 0 or not any(inside):
@@ -450,7 +495,7 @@ def run(args):
 
         detections = store.get_frame_annotation(frame_num, source=args.detection_model)
         detected_boxes = detections[0]
-        detected_boxes[:, :4] = ultralytics.utils.ops.xywhn2xyxy(detected_boxes[:, :4], *frame.shape[1::-1])
+        detected_boxes[:, :4] = ultralytics.utils.ops.xywhn2xyxy(detected_boxes[:, :4], original_w, original_h)
 
         player.render()
         # Check if the click point is inside any of the boxes

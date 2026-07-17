@@ -77,6 +77,19 @@ as `osnet_ain_x1_0_msmt17.pt`, and it will be auto-downloaded on first use; othe
 [torchreid model zoo](https://kaiyangzhou.github.io/deep-person-reid/MODEL_ZOO.html)) at `data/` yourself. We used
 `osnet_ain_x1_0` trained on MSMT17 for cross-domain re-identification.
 
+#### Proxy media for faster scrubbing
+
+`--crop` normally still decodes full-resolution frames. Pre-generate a cropped proxy and `annotate.py` decodes that
+instead, given the same `--crop` value:
+
+```
+uv run python scripts/make_proxy.py --crop 1152 576 460 1171 data/DM26/DJI_20260606051302_0005_D.MP4
+uv run python annotate.py data/DM26 --source data/DM26/DJI_20260606051302_0005_D.MP4 --crop 1152 576 460 1171
+```
+
+Proxies live in `<source_dir>/proxies/`; `annotate.py` falls back to the original if none matches. Not
+staleness-checked against re-exported sources — pass `--force` to regenerate. No audio.
+
 #### The timing prior
 
 Appearance isn't the only clue to who just crossed: a runner's lap history says a lot about whether they're plausibly

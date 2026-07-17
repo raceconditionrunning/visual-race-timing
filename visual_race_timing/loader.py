@@ -40,6 +40,10 @@ class Loader:
     def get_image_size(self):
         return tuple(reversed(self.get_image_dims()))
 
+    def get_crop_offset(self):
+        """(x, y) offset of decoded frames' origin within the original frame."""
+        return (self.crop[2], self.crop[3]) if self.crop else (0, 0)
+
     def get_current_time(self) -> Optional[Timecode]:
         raise NotImplementedError("get_current_time must be implemented by subclass")
 
@@ -145,13 +149,24 @@ class ImageLoader(Loader):
 
 
 class VideoLoader(Loader):
-    def __init__(self, paths: List[pathlib.Path], batch=1, vid_stride=1, crop=None):
+    def __init__(self, paths: List[pathlib.Path], batch=1, vid_stride=1, crop=None, source_dims=None):
+        """
+        source_dims: pass the true original (height, width) when `paths` are
+        proxy files that already represent `crop` of the original — this
+        overrides get_image_dims() (which would otherwise report the smaller
+        proxy dims) and signals that frames arrive pre-cropped, so `crop`
+        is used only for get_crop_offset(), not sliced again on decode.
+        """
         self._timecodes = [get_timecode(source) for source in paths]
         # Sort sources by timecode
         paths = [source for _, source in sorted(zip(self._timecodes, paths))]
         self._timecodes = [get_timecode(source) for source in paths]
         super().__init__(paths, batch, crop=crop)
-        self._source_dims = [get_video_height_width(source) for source in paths]
+        self._frames_precropped = source_dims is not None
+        if source_dims is not None:
+            self._source_dims = [source_dims for _ in paths]
+        else:
+            self._source_dims = [get_video_height_width(source) for source in paths]
         assert all(
             [dim == self._source_dims[0] for dim in self._source_dims]), "All videos must have the same dimensions"
         assert all([timecode.framerate == self._timecodes[0].framerate for timecode in self._timecodes]), \
@@ -244,7 +259,7 @@ class VideoLoader(Loader):
                     # NOTE: Because the cap won't increment past the last frame of the video, the source_frame counter won't increment when retrieving the last frame.
                     # when that happens, this calculated value will be off by one.
                     # alt_frame_timecode = self._timecodes[self.source_index] + self._source_frame - 1 + self.gap_offset
-                    if self.crop:
+                    if self.crop and not self._frames_precropped:
                         # given in ffmpeg format: width:height:x:y
                         im0 = im0[self.crop[3]:self.crop[3] + self.crop[1], self.crop[2]:self.crop[2] + self.crop[0]]
                     imgs.append(im0)

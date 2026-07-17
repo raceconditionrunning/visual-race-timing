@@ -6,10 +6,11 @@ from timecode import Timecode
 from collections import deque
 from visual_race_timing.drawing import render_timecode
 from visual_race_timing.loader import ImageLoader, VideoLoader
+from visual_race_timing.video import get_video_height_width
 
 
 class MediaPlayer:
-    def __init__(self, paused=False, crop=None):
+    def __init__(self, paused=False):
         self.click_delegate = lambda frame, frame_number, mouse_pt, flags: None
         self.annotation_updated = lambda annotation_id, annotation, frame_number: None
         self.pre_display = lambda frame, frame_number: frame
@@ -28,26 +29,22 @@ class MediaPlayer:
         self.start_point = None
         self.end_point = None
         self.window_name = 'Edit Race Annotations'
-        self.crop = crop
 
-    def _crop_for_display(self, frame):
-        """Crop a full-resolution frame down to the display area, if --crop is set.
-
-        crop is (w, h, x, y), matching detect.py/VideoLoader's ffmpeg-style
-        convention. Applied only at the very end of rendering so annotation
-        overlays and click coordinates keep working in full-frame space.
-        """
-        if self.crop:
-            w, h, x, y = self.crop
-            return frame[y:y + h, x:x + w]
-        return frame
+    def frame_offset(self):
+        """(x, y) offset of _last_frame_img's origin within the original,
+        uncropped frame that stored annotations are normalized against."""
+        return self.loader.get_crop_offset()
 
     def _to_frame_point(self, x, y):
-        """Translate a point from the (possibly cropped) display window back to full-frame coordinates."""
-        if self.crop:
-            _, _, cx, cy = self.crop
-            return x + cx, y + cy
-        return x, y
+        """Translate a point from the display window into full-frame coordinates."""
+        ox, oy = self.frame_offset()
+        return x + ox, y + oy
+
+    def _to_local_point(self, x, y):
+        """Translate a point from full-frame coordinates into the pixel space
+        of _last_frame_img (the inverse of frame_offset())."""
+        ox, oy = self.frame_offset()
+        return x - ox, y - oy
 
     def get_last_timecode(self) -> Timecode:
         """ Return the timecode of the last frame displayed. Returns None if no frame has been displayed. """
@@ -72,17 +69,16 @@ class MediaPlayer:
 
         self.draw_active_annotation(frame)
         render_timecode(current_timecode, frame, frame)
-        # pre_display (e.g. annotation overlays) needs the full frame, since
-        # stored annotations are normalized against the uncropped frame size.
+        # pre_display draws onto frame as-is, so it must denormalize stored
+        # annotations against the loader's original dims and frame_offset().
         display_frame = self.pre_display(frame, current_timecode.frames)
-        cv2.imshow(self.window_name, self._crop_for_display(display_frame))
+        cv2.imshow(self.window_name, display_frame)
 
     def mouse_callback(self, event, x, y, flags, param):
         if not self.paused:
             return
-        # Mouse coordinates are relative to the (possibly cropped) display
-        # window; translate them back to full-frame coordinates before using
-        # them, since annotations/clicks are handled in full-frame space.
+        # Mouse coordinates are relative to the display window; translate them
+        # into full-frame coordinates, since annotations/clicks are stored there.
         if event == cv2.EVENT_LBUTTONUP:
             click_pt = self._to_frame_point(x, y)
             result = self.click_delegate(self._last_frame_img, self.get_last_timecode().frames, click_pt, flags)
@@ -91,8 +87,8 @@ class MediaPlayer:
         if event == cv2.EVENT_RBUTTONDOWN:
             self.start_point = self._to_frame_point(x, y)
             dotted = self._last_frame_img.copy()
-            cv2.circle(dotted, self.start_point, 5, (0, 255, 0), -1)
-            cv2.imshow(self.window_name, self._crop_for_display(dotted))
+            cv2.circle(dotted, self._to_local_point(*self.start_point), 5, (0, 255, 0), -1)
+            cv2.imshow(self.window_name, dotted)
         elif event == cv2.EVENT_RBUTTONUP:
             self.end_point = self._to_frame_point(x, y)
             # ignore small boxes
@@ -107,9 +103,10 @@ class MediaPlayer:
             self.end_point = end_point
             # Draw the box so we can confirm
             frame = self._last_frame_img.copy()
-            cv2.rectangle(frame, self.start_point, self.end_point, (0, 255, 0), 2)
+            cv2.rectangle(frame, self._to_local_point(*self.start_point), self._to_local_point(*self.end_point),
+                          (0, 255, 0), 2)
             render_timecode(self.get_last_timecode(), frame, frame)
-            cv2.imshow(self.window_name, self._crop_for_display(frame))
+            cv2.imshow(self.window_name, frame)
             cv2.waitKey(1)
 
             try:
@@ -125,8 +122,10 @@ class MediaPlayer:
 
     def draw_active_annotation(self, frame):
         if self.start_point is not None and self.end_point is not None:
-            cv2.rectangle(frame, self.start_point, self.end_point, (0, 255, 0), 2)
-            cv2.putText(frame, "", (self.start_point[0], self.start_point[1] - 10),
+            local_start = self._to_local_point(*self.start_point)
+            local_end = self._to_local_point(*self.end_point)
+            cv2.rectangle(frame, local_start, local_end, (0, 255, 0), 2)
+            cv2.putText(frame, "", (local_start[0], local_start[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2, cv2.LINE_AA)
 
     def handle_key_input(self):
@@ -163,9 +162,10 @@ class MediaPlayer:
 
 
 class VideoPlayer(MediaPlayer):
-    def __init__(self, sources, paused=False, **kwargs):
+    def __init__(self, sources, paused=False, crop=None, original_sources=None, **kwargs):
         super().__init__(paused, **kwargs)
-        self.loader = VideoLoader(sources)
+        source_dims = get_video_height_width(original_sources[0]) if original_sources else None
+        self.loader = VideoLoader(sources, crop=crop, source_dims=source_dims)
         self._last_timecode = None
 
     def seek_time(self, time_str: str) -> bool:
@@ -366,13 +366,9 @@ class DisplayWindow:
 
 
 class PhotoPlayer(MediaPlayer):
-    def __init__(self, frame_directory, paused=False, **kwargs):
-        # crop is display-only (see MediaPlayer._crop_for_display), so it must not
-        # reach ImageLoader: baking it into the decoded frame would break annotation
-        # overlay math, which assumes frame.shape matches the uncropped image.
-        crop = kwargs.pop('crop', None)
-        self.loader = ImageLoader(frame_directory, **kwargs)
-        super().__init__(paused, crop=crop)
+    def __init__(self, frame_directory, paused=False, crop=None, **kwargs):
+        self.loader = ImageLoader(frame_directory, crop=crop, **kwargs)
+        super().__init__(paused)
         self.index = 0
         self._last_frame_timecode = None
 
