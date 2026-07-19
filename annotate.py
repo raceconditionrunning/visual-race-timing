@@ -231,10 +231,10 @@ def run(args):
         return True
 
     def key_delegate(frame, frame_num, key, runner_id: str = None):
-        if key == ord('\b'):
+        if key == ord(','):
             # Jump back 10s
             player.seek_timecode_frame(frame_num - 10 * round(float(player.get_last_timecode().framerate)))
-        elif key == 201:  # F12, since we can't detect the delete key
+        elif key == ord('.'):
             # Jump forward 10s
             player.seek_timecode_frame(frame_num + 10 * round(float(player.get_last_timecode().framerate)))
         elif key == ord('`'):
@@ -329,13 +329,11 @@ def run(args):
                                                                             new_annotation_id)
             player.render()
             return None
-        elif key == ord('[') or key == ord(']') or key == ord('{') or key == ord('}'):
-            crossings_only = True if key == ord('{') or key == ord('}') else None
-            if key == ord('[') or key == ord('{'):
-                next_frame = store.scan_to_annotation(frame_num, previous=True, crossing=crossings_only, source="human")
+        elif key == ord('[') or key == ord(']'):
+            if key == ord('['):
+                next_frame = store.scan_to_annotation(frame_num, previous=True, source="human")
             else:
-                next_frame = store.scan_to_annotation(frame_num, previous=False, crossing=crossings_only,
-                                                      source="human")
+                next_frame = store.scan_to_annotation(frame_num, previous=False, source="human")
 
             if next_frame:
                 logger.info(
@@ -351,33 +349,65 @@ def run(args):
                 logger.info("No further annotations.")
                 return None
         elif key == ord('9') or key == ord('0'):
-            # Seek to line detection
+            # Seek to the nearest detection overlapping the finish line
             fps = player.get_last_timecode().framerate
-            # Scans normalized annotations across many frames, so use original dims.
-            frame_h, frame_w = player.loader.get_image_dims()
-            previous = key == ord('9')
+            dims = player.loader.get_image_dims()
+            direction = 1 if key == ord('0') else -1
 
-            def on_line(x):
-                p0, p1 = get_finish_line(race_config, Timecode(fps, frames=x["frame_number"]),
-                                         frame_width=frame_w, frame_height=frame_h)
-                boxes = ultralytics.utils.ops.xywhn2xyxy(
-                    np.array([x["x_center"], x["y_center"], x["width"], x["height"]]), frame_w, frame_h)
-                return any(line_segment_to_box_distance(p0, p1, boxes) < 10)
-
-            next_frame = store.scan_to_annotation(frame_num, previous=previous, source=args.detection_model,
-                                                  custom_check=on_line)
-
-            if next_frame:
-                next_timecode = Timecode(player.get_last_timecode().framerate,
-                                         frames=next_frame)
+            next_frame = scan_to_near_line_detection(store, race_config, fps, dims, frame_num,
+                                                     args.detection_model, direction=direction)
+            if next_frame is not None:
                 logger.info(
-                    f"Found a runner on the line at {next_frame} ({next_timecode}), seeking to it.")
-                player.seek_timecode(next_timecode)
+                    f"Nearest on-line detection at frame {next_frame} "
+                    f"({Timecode(player.get_last_timecode().framerate, frames=next_frame)}); seeking.")
+                success = player.seek_timecode_frame(next_frame)
+                if not success:
+                    logger.error(f"Failed to seek to frame {next_frame}.")
+                    return None
                 player._advance_frame()
                 player.render()
                 return None
-            logger.info("No further detections on the line.")
-            return None
+            else:
+                logger.info("No further detections near the line.")
+                return None
+        elif key == ord('{') or key == ord('}'):
+            # Smart seek: nearest inferred crossing (any runner) from the playhead.
+            fps = player.get_last_timecode().framerate
+            dims = player.loader.get_image_dims()
+            direction = 1 if key == ord('}') else -1
+
+            scan = find_nearest_crossing(store, race_config, fps, dims, frame_num, args.detection_model,
+                                         direction=direction)
+
+            if scan.best is not None:
+                ties = [c for c in scan.candidates
+                       if c is not scan.best and abs(c.crossing_frame - scan.best.crossing_frame) <= 2]
+                tie_note = f", {len(ties)} tied within 2 frames" if ties else ""
+                logger.info(
+                    f"Nearest crossing at frame {scan.best.crossing_frame} "
+                    f"(confidence {scan.best.result.confidence:.2f}, {len(scan.candidates)} candidate(s) found{tie_note}); "
+                    f"seeking. Shift-click the runner there to confirm the crossing.")
+                success = player.seek_timecode_frame(scan.best.crossing_frame)
+                if not success:
+                    logger.error(f"Failed to seek to frame {scan.best.crossing_frame}.")
+                    return None
+                player._advance_frame()
+                player.render()
+                return None
+            elif scan.reason == "no_confirmed_crossing":
+                logger.info(
+                    f"No confirmed crossing found ({scan.seeds_tried} seed(s) tried); "
+                    f"seeking to the nearest on-line detection instead.")
+                success = player.seek_timecode_frame(scan.first_seed_frame)
+                if not success:
+                    logger.error(f"Failed to seek to frame {scan.first_seed_frame}.")
+                    return None
+                player._advance_frame()
+                player.render()
+                return None
+            else:
+                logger.info(f"No further detections near the line (scanned {scan.frames_scanned} frames).")
+                return None
         elif key == ord('(') or key == ord(')'):
             # Track forward/backward
             fps = player.get_last_timecode().framerate
@@ -462,6 +492,24 @@ def run(args):
                 i += 1 if key == ord(')') else -1
         return None
 
+    def guess_crossing_and_seek(frame_num, clicked_box):
+        fps = player.get_last_timecode().framerate
+        dims = player.loader.get_image_dims()
+        result = guess_crossing_frame(
+            store, race_config, fps, dims, frame_num, clicked_box[:4], args.detection_model, direction=1,
+        )
+        if result.frame is None:
+            logger.info(f"No confident crossing guess for the clicked runner ({result.reason}).")
+            return
+        logger.info(f"Guessed crossing at frame {result.frame} (confidence {result.confidence:.2f}); seeking. "
+                   f"Shift-click the runner there to confirm the crossing.")
+        success = player.seek_timecode_frame(result.frame)
+        if not success:
+            logger.error(f"Failed to seek to guessed crossing frame {result.frame}.")
+            return
+        player._advance_frame()
+        player.render()
+
     def click_delegate(frame, frame_num, click_pt, flags):
         # click_pt is in full-frame coords; denormalize boxes to match.
         original_w, original_h = player.loader.get_image_dims()[::-1]
@@ -506,6 +554,9 @@ def run(args):
             print("Multiple boxes found, please click inside only one box.")
             return
         clicked_box = detected_boxes[np.where(inside)[0][0]]
+        if flags & cv2.EVENT_FLAG_ALTKEY:
+            guess_crossing_and_seek(frame_num, clicked_box)
+            return
         # Shift click makes the new box a crossing too
         player.annotation_updated(None, [clicked_box[0:2], clicked_box[2:4]], player.get_last_timecode(),
                                   crossing=((flags & cv2.EVENT_FLAG_SHIFTKEY) > 0),

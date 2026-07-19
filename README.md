@@ -127,13 +127,12 @@ While the GUI window has focus, you can use the following keyboard commands:
 | `r`                                  | Reassign runner ID (via CLI prompt for runner ID)                                    |
 | `R`                                  | Reassign runner ID, propagated to nearby frames (via CLI prompt for runner ID)       |
 | `[` or `]`                           | Prev/next annotation                                                                 |
-| `{` or `}`                           | Prev/next crossing annotation                                                        |
 | `9` or `0`                           | Prev/next detection overlapping finish line                                         |
+| `{` or `}`                           | Smart seek: prev/next inferred crossing (any runner)                                |
 | `(` or `)`                           | Prev/next frame                                                                      |
 | `s`                                  | Seek to timecode (via `HH:MM:SS` CLI input)                                          |
 | \`                                   | Create note annotation (via CLI)                                                     |
-| `Backspace`                          | Jump backward 10s                                                                    |
-| `Delete`                             | Jump forward 10s                                                                     |
+| `,` or `.`                           | Jump backward/forward 10s                                                            |
 | `Space`                              | Pause/Play video                                                                     |
 | `+` or `-`                           | Increase/decrease playback speed                                                     |
 

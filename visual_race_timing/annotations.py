@@ -94,6 +94,7 @@ class SQLiteAnnotationStore:
                                CREATE INDEX IF NOT EXISTS idx_frame_crossing ON annotations(frame_number, is_crossing);
                                CREATE INDEX IF NOT EXISTS idx_source ON annotations(source);
                                CREATE INDEX IF NOT EXISTS idx_frame_source ON annotations(frame_number, source);
+                               CREATE INDEX IF NOT EXISTS idx_source_frame ON annotations(source, frame_number);
                                CREATE INDEX IF NOT EXISTS idx_notes_frame ON notes(frame_number);
                                CREATE INDEX IF NOT EXISTS idx_notes_runner ON notes(runner_id);
 
