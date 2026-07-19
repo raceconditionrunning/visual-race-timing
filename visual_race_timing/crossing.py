@@ -223,9 +223,7 @@ class CrossingDetector:
     ``push`` is O(1): a point contributes exactly one new signed-distance
     sample and at most one new sign flip at the tail, and earlier samples never
     change (``d`` for a row depends only on that row's own frame + position --
-    see :func:`_signed_distance_one`). So the whole per-frame rescan the batch
-    form used to do -- recomputing the signed distance over the growing track
-    every step, O(n^2) over a walk -- collapses to O(n) total.
+    see :func:`_signed_distance_one`).
 
     The one non-obvious piece: ``sub_frame`` and the interpolated anchor point
     are *symmetric* in the two bracketing samples
@@ -243,11 +241,6 @@ class CrossingDetector:
         self.frame_dims = frame_dims
         self.eps = hysteresis_frac * frame_dims[0]
         self.segment_margin = segment_margin
-        # Points are pushed in walk order; for a backward walk (direction == -1)
-        # the previously-pushed sample is the later-in-time one. The batch code
-        # only treats a sign change as a flip when the *later* sample is off the
-        # line (``d[i] != 0``), so which sample that rule applies to flips with
-        # walk direction -- see push().
         assert direction in (1, -1)
         self.direction = direction
 
@@ -406,17 +399,8 @@ def guess_crossing_frame(
 ) -> GuessResult:
     """Track from a clicked/seed detection and find where it crosses the line.
 
-    Baseline (build order step 1): bbox bottom-center anchor, no ReID/pose.
-
     Unlike ``track_boxes``, this checks for a confirmed crossing after every
-    new matched frame and stops the walk the moment one is found -- it does
-    not keep walking to loss/cap once it already has the answer. That keeps
-    ``quality.lost`` meaningful as a trust signal: it's only True when the
-    walk genuinely ran out of track *before* finding anything, not whenever
-    a (possibly already-answered) walk happens to run off the edge of
-    available detections, which -- since only near-line boxes are ever
-    detected/stored (see ``detect.py``'s on-line filter) -- it eventually
-    always would.
+    new matched frame and stops the walk the moment one is found.
     """
     fps_f = float(fps)
     cap_frames = max(1, round(cap_seconds * fps_f))
@@ -430,7 +414,7 @@ def guess_crossing_frame(
     last_reason = "no_sign_change"
 
     # The detector is fed anchor points in walk (`direction`) order as they're
-    # matched -- no per-frame rescan of the growing track. It is symmetric in
+    # matched. It is symmetric in
     # time, so a backward walk needs no reversal (see CrossingDetector).
     detector = CrossingDetector(race_config, fps_f, frame_dims,
                                 hysteresis_frac=hysteresis_frac, segment_margin=segment_margin,
@@ -471,18 +455,14 @@ def guess_crossing_frame(
     if quality.lost and len(anchor_track) < 2:
         return GuessResult(None, None, 0.0, anchor_track, quality, reason="lost_immediately")
 
-    # Only blame track loss when we never even saw a sign change to evaluate --
-    # if find_zero_crossing rejected a real candidate (jitter/off-segment),
-    # that's the more specific, correct diagnostic.
+    # Only blame track loss when we never even saw a sign change to evaluate
     reason = "lost_track" if (quality.lost and last_reason == "no_sign_change") else last_reason
     return GuessResult(None, None, 0.0, anchor_track, quality, reason=reason)
 
 
 DEFAULT_LINE_DIST_PX = 10.0
 DEFAULT_MAX_SCAN_SECONDS = 120.0
-# ~2x the median near-line window (see NEAREST_CROSSING_SCAN_PLAN.md); a
-# pragmatic (not provably-safe) bound on how far past the current best to
-# keep scanning for a backward-from-a-later-seed candidate that beats it.
+# ~2x the median near-line window
 _TERMINATION_MARGIN_FRAMES = 15
 
 
@@ -507,15 +487,6 @@ class ScanResult:
 
 class _ScanCache:
     """Memoizes ``get_frame_annotation(frame, source=...)`` for one scan.
-
-    ``guess_crossing_frame``'s bidirectional per-seed walks overlap heavily
-    in frame range in a pack (many runners near the line at once), and
-    ``get_frame_annotation`` opens a fresh sqlite connection per call --
-    on a crowded frame that can mean tens of seeds each coasting to their
-    12s cap before giving up, which is the difference between a sub-second
-    scan and a multi-second one. ``frame_dims`` is constant within a scan so
-    it's not part of the cache key. Delegates everything else (notably
-    ``scan_to_annotation``) straight through to the wrapped store.
     """
 
     def __init__(self, store):
@@ -546,9 +517,8 @@ def scan_to_near_line_detection(
     line_dist_px: float = DEFAULT_LINE_DIST_PX,
 ) -> Optional[int]:
     """Nearest frame to ``playhead`` (in ``direction``) with a detection box
-    within ``line_dist_px`` of the finish line. Unlike ``find_nearest_crossing``,
-    this does no crossing inference -- it just steps to the next on-line
-    detection. Returns the frame number, or None if none is found in range."""
+    within ``line_dist_px`` of the finish line.
+     Returns the frame number, or None if none is found in range."""
     assert direction in (1, -1)
     fps_f = float(fps)
     max_scan_frames = max(1, round(max_scan_seconds * fps_f))
@@ -593,21 +563,10 @@ def find_nearest_crossing(
     directions -- a runner spotted near the line may have already crossed,
     so a backward search from that seed is what would find it.
 
-    Dedup is by anchor-track coverage, not proximity-to-seed: a runner sits
-    near the line for many consecutive frames, and naively seeding every one
-    would redundantly re-run the same search. Each ``guess_crossing_frame``
-    call's ``anchor_track`` records the exact positions it walked through;
-    a new near-line box is skipped only if its own anchor lands within
-    ``0.25 * box_height`` of an already-covered anchor *at that exact
-    frame* -- so two different runners near the line in the same frame
-    (a pack) are never confused for one another.
-
-    Termination is a pragmatic bound, not a proof: scanning stops once the
+    scanning stops once the
     outer position passes ``best.crossing_frame + direction * W`` where
     ``W = ceil(coast_seconds * fps) + 15``, or once ``max_scan_seconds`` is
-    exhausted. See NEAREST_CROSSING_SCAN_PLAN.md for why a fully-correct
-    bound (scanning the full cap_seconds window past every best candidate)
-    isn't worth its cost here.
+    exhausted.
     """
     assert direction in (1, -1)
     fps_f = float(fps)
