@@ -6,6 +6,7 @@ from timecode import Timecode
 from collections import deque
 from visual_race_timing.drawing import render_timecode
 from visual_race_timing.loader import ImageLoader, VideoLoader
+from visual_race_timing.transport_bar import TransportBar
 from visual_race_timing.video import get_video_height_width
 
 
@@ -29,6 +30,10 @@ class MediaPlayer:
         self.start_point = None
         self.end_point = None
         self.window_name = 'Edit Race Annotations'
+
+        # NLE-style transport bar docked below the frame. Callers extend it via
+        # self.transport.add_seek_steppers(...).
+        self.transport = TransportBar()
 
     def frame_offset(self):
         """(x, y) offset of _last_frame_img's origin within the original,
@@ -72,10 +77,26 @@ class MediaPlayer:
         # pre_display draws onto frame as-is, so it must denormalize stored
         # annotations against the loader's original dims and frame_offset().
         display_frame = self.pre_display(frame, current_timecode.frames)
+        if self.transport.visible:
+            display_frame = self.transport.compose(display_frame, paused=self.paused, delay=self.delay)
         cv2.imshow(self.window_name, display_frame)
 
     def mouse_callback(self, event, x, y, flags, param):
+        # Transport-bar clicks work whether playing or paused, and must be
+        # handled before anything translates the point into frame coordinates.
+        if event == cv2.EVENT_LBUTTONUP:
+            key = self.transport.hit(x, y)
+            if key is not None:
+                self.dispatch_key(key)
+                # Frame steps re-render via the play loop; a click while paused
+                # (e.g. speed change) needs an explicit refresh to update the bar.
+                if self.paused:
+                    self.render()
+                return
         if not self.paused:
+            return
+        if self.transport.in_chrome(y):
+            # Landed on the transport chrome, not the frame; ignore for annotation.
             return
         # Mouse coordinates are relative to the display window; translate them
         # into full-frame coordinates, since annotations/clicks are stored there.
@@ -130,7 +151,11 @@ class MediaPlayer:
 
     def handle_key_input(self):
         key = cv2.waitKey(self.delay) & 0xFF
+        return self.dispatch_key(key)
 
+    def dispatch_key(self, key):
+        """Route a key to its action. Shared by keyboard input and transport-bar
+        clicks (each button simply dispatches its key). Returns -1 to quit."""
         if key == ord('q'):  # Quit
             return -1
         elif key == ord(' '):  # Pause/play toggle

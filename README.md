@@ -110,6 +110,11 @@ and neither win nor lose ground.
 
 #### Commands
 
+A transport bar is docked below the frame. Its cells are clickable and dispatch the same
+commands as the shortcuts below: seek steppers for `Frame`, `Detection` (nearest on-line detection),
+`Annot`, and `Smart` (nearest inferred crossing); `-10s`/`+10s` jumps; play/pause; and a playback-speed
+readout with `-`/`+`.
+
 While the GUI window has focus, you can use the following keyboard commands:
 
 | Input                                | Action                                                                             |

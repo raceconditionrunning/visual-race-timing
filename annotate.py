@@ -21,6 +21,7 @@ from visual_race_timing.race_config import build_start_realtime, get_finish_line
 from visual_race_timing.timing_prior import TimingPrior, fuse_ranking
 from visual_race_timing.tracker import RaceTracker
 
+from visual_race_timing.crossing import guess_crossing_frame, find_nearest_crossing, scan_to_near_line_detection
 from visual_race_timing.geometry import line_segment_to_box_distance
 from visual_race_timing.prompts import ask_for_id
 from visual_race_timing.media_player import VideoPlayer, PhotoPlayer, BufferedVideoPlayer
@@ -567,6 +568,11 @@ def run(args):
     player.annotation_updated = annotation_updated
     player.pre_display = overlay_annotations
     player.key_delegate = key_delegate
+    player.transport.add_seek_steppers([
+        {'type': 'stepper', 'label': 'Detection', 'prev': ord('9'), 'next': ord('0')},
+        {'type': 'stepper', 'label': 'Annot', 'prev': ord('['), 'next': ord(']')},
+        {'type': 'stepper', 'label': 'Smart', 'prev': ord('{'), 'next': ord('}')},
+    ])
     player.play()
     cv2.waitKey(0)
     logger.info("Saving reid bank...")
