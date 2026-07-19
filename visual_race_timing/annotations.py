@@ -553,6 +553,17 @@ class SQLiteAnnotationStore:
                            AND runner_id = ?
                          ''', (to_id_int, frame_number, from_id_int))
 
+    def get_crossing_frames(self, source: str = None) -> List[int]:
+        """Frame numbers holding at least one crossing annotation, ascending."""
+        query = "SELECT DISTINCT frame_number FROM annotations WHERE is_crossing = 1"
+        params = []
+        if source is not None:
+            query += " AND source = ?"
+            params.append(source)
+        query += " ORDER BY frame_number"
+        with sqlite3.connect(self.db_path) as conn:
+            return [row[0] for row in conn.execute(query, params).fetchall()]
+
     def build_crossing_map(self) -> np.ndarray:
         """Build crossing distance map - much more efficient with SQL"""
         with sqlite3.connect(self.db_path) as conn:

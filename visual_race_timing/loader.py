@@ -125,6 +125,11 @@ class ImageLoader(Loader):
             return None
         return self.source_index
 
+    def get_frame_range(self):
+        """(first, last) absolute frame numbers spanned by the sources, in the
+        same absolute-frame space used by annotations and seeks."""
+        return self._timecodes[0].frames, self._timecodes[-1].frames + 1
+
     def seek_timecode_frame(self, target_frame: int):
         target_timecode = Timecode(self._timecodes[0].framerate, frames=target_frame)
         return self.seek_timecode(target_timecode)
@@ -306,6 +311,12 @@ class VideoLoader(Loader):
         if self.source_index >= len(self._timecodes):
             return None
         return self._current_frame
+
+    def get_frame_range(self):
+        """(first, last) absolute frame numbers spanned by the sources."""
+        start = self._timecodes[0].frames
+        end = (self._timecodes[-1] + self._frame_lengths[-1]).frames
+        return start, end
 
     def seek_time(self, time_str: str) -> bool:
         target_time = Timecode(self._timecodes[0].framerate, time_str)

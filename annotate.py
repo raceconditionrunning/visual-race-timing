@@ -17,7 +17,8 @@ from visual_race_timing.annotations import SQLiteAnnotationStore
 from visual_race_timing.drawing import draw_annotation
 from visual_race_timing.proxy import find_proxy
 from visual_race_timing.reid_bank import DEFAULT_REID_WEIGHTS, ReIDBank, available_reid_models, build_extractor
-from visual_race_timing.race_config import build_start_realtime, get_finish_line
+from visual_race_timing.race_config import assign_start_by_runner, build_start_realtime, get_finish_line
+from visual_race_timing.participant_console import ParticipantConsole
 from visual_race_timing.timing_prior import TimingPrior, fuse_ranking
 from visual_race_timing.tracker import RaceTracker
 
@@ -156,10 +157,15 @@ def run(args):
     # crossing-ID guess. Built lazily from the store's human crossings and
     # invalidated whenever a crossing is added/toggled so it stays current with
     # the session. Only applied to on-the-line crossing guesses (see below).
-    _timing = {"prior": None}
+    _timing = {"prior": None, "crossing_frames": None}
 
     def invalidate_timing_prior():
         _timing["prior"] = None
+        _timing["crossing_frames"] = None
+
+    def refresh_marks():
+        """Repaint the transport density strip from current crossing annotations."""
+        player.transport.set_marks(store.get_crossing_frames(source="human"))
 
     def get_timing_prior():
         if _timing["prior"] is None:
@@ -177,6 +183,83 @@ def run(args):
             start_map = build_start_realtime(race_config, fps)
             _timing["prior"] = TimingPrior.build(crossings_by_runner, start_map)
         return _timing["prior"]
+
+    def get_crossing_frames_by_runner():
+        """Per-runner confirmed-crossing frame numbers (ascending), cached and
+        invalidated alongside the timing prior. Drives the participant console's
+        per-runner navigation."""
+        if _timing["crossing_frames"] is None:
+            ann = store.load_all_annotations(source="human", crossing=True)
+            by_runner = defaultdict(list)
+            for frame_num, data in ann.items():
+                frame_boxes = data["boxes"]
+                if frame_boxes is None or frame_boxes.size == 0:
+                    continue
+                for rid in frame_boxes[:, 4].astype(int):
+                    if int(rid) in race_config["participants"]:
+                        by_runner[int(rid)].append(frame_num)
+            for rid in by_runner:
+                by_runner[rid].sort()
+            _timing["crossing_frames"] = by_runner
+        return _timing["crossing_frames"]
+
+    def console_rows(frame_num):
+        """One (rid, confirmed_count, state) row per participant, in config order.
+        A runner is 'predict' (amber) once the playhead is at/past their last
+        confirmed crossing -- i.e. no confirmed crossing lies ahead."""
+        by_runner = get_crossing_frames_by_runner()
+        rows = []
+        for rid in race_config["participants"]:
+            frames = by_runner.get(int(rid), [])
+            state = 'neutral' if any(f > frame_num for f in frames) else 'predict'
+            rows.append((int(rid), len(frames), state))
+        return rows
+
+    def console_seek(action):
+        """Dispatch a participant-console arrow. Forward flips to the runner's
+        next confirmed crossing; past their last one it projects the next
+        (unconfirmed) crossing from the timing prior's expected lap. Backward
+        flips to the previous confirmed crossing and clamps at the first."""
+        _, rid, direction = action
+        frame_num = player.get_last_timecode().frames
+        fps = float(player.get_last_timecode().framerate)
+        frames = get_crossing_frames_by_runner().get(int(rid), [])
+
+        if direction < 0:
+            behind = [f for f in frames if f < frame_num]
+            if not behind:
+                logger.info(f"{format(rid, '02x')}: at first confirmed crossing.")
+                return
+            target = behind[-1]
+        else:
+            ahead = [f for f in frames if f > frame_num]
+            if ahead:
+                target = ahead[0]
+            else:
+                # Past the last confirmed crossing: project from expected lap.
+                if frames:
+                    base = frames[-1]
+                else:
+                    start_tc = assign_start_by_runner(race_config, fps).get(int(rid))
+                    if start_tc is None:
+                        logger.info(f"{format(rid, '02x')}: no crossings or wave start to project from.")
+                        return
+                    base = start_tc.frames
+                mu = get_timing_prior().expected_lap(int(rid))
+                mu_frames = max(1, round(mu * fps))
+                k = 1
+                target = base + k * mu_frames
+                while target <= frame_num and k < 100:
+                    k += 1
+                    target = base + k * mu_frames
+                logger.info(f"{format(rid, '02x')}: past last confirmed crossing; "
+                            f"projecting next at frame {target} (~{mu:.0f}s lap).")
+
+        if player.seek_timecode_frame(target):
+            player._advance_frame()
+            player.render()
+        else:
+            logger.error(f"Failed to seek to frame {target}.")
 
     def calculate_reid_distances(box, exclude: List[int] = [], timecode=None, crossing=False):
         new_box = np.atleast_2d(box)
@@ -229,6 +312,7 @@ def run(args):
         if crossing:
             # New crossing labeled -> the timing prior's history is now stale.
             invalidate_timing_prior()
+            refresh_marks()
         return True
 
     def key_delegate(frame, frame_num, key, runner_id: str = None):
@@ -312,6 +396,7 @@ def run(args):
                         f"Unmarked {runner_id} {player.get_last_timecode()} ({player.get_last_timecode().frames}) as crossing.")
                 # Crossing history changed -> refresh the timing prior lazily.
                 invalidate_timing_prior()
+                refresh_marks()
             elif key == ord('r') or key == ord("R"):
                 # Can be reassigned to anything, but null out current ID under the assumption we want a different result
                 # FIXME: Occasional crasher, probably when reassigning with a single box in the frame
@@ -573,6 +658,9 @@ def run(args):
         {'type': 'stepper', 'label': 'Annot', 'prev': ord('['), 'next': ord(']')},
         {'type': 'stepper', 'label': 'Smart', 'prev': ord('{'), 'next': ord('}')},
     ])
+    # Density strip: click to seek, filled by crossing annotations.
+    player.transport.set_timeline(*player.loader.get_frame_range())
+    refresh_marks()
     player.play()
     cv2.waitKey(0)
     logger.info("Saving reid bank...")

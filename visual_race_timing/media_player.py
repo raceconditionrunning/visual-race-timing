@@ -78,7 +78,8 @@ class MediaPlayer:
         # annotations against the loader's original dims and frame_offset().
         display_frame = self.pre_display(frame, current_timecode.frames)
         if self.transport.visible:
-            display_frame = self.transport.compose(display_frame, paused=self.paused, delay=self.delay)
+            display_frame = self.transport.compose(display_frame, paused=self.paused, delay=self.delay,
+                                                    current_frame=current_timecode.frames)
         cv2.imshow(self.window_name, display_frame)
 
     def mouse_callback(self, event, x, y, flags, param):
@@ -91,6 +92,14 @@ class MediaPlayer:
                 # Frame steps re-render via the play loop; a click while paused
                 # (e.g. speed change) needs an explicit refresh to update the bar.
                 if self.paused:
+                    self.render()
+                return
+            # Scrubbing the density strip: seek to the clicked frame. Mirrors the
+            # seek-then-advance idiom used by the annotation seek shortcuts.
+            seek_frame = self.transport.hit_timeline(x, y)
+            if seek_frame is not None:
+                if self.seek_timecode_frame(seek_frame):
+                    self._advance_frame()
                     self.render()
                 return
         if not self.paused:
@@ -405,6 +414,9 @@ class PhotoPlayer(MediaPlayer):
 
     def seek_timecode(self, timecode: Timecode) -> bool:
         return self.loader.seek_timecode(timecode)
+
+    def seek_timecode_frame(self, frame_number: int) -> bool:
+        return self.loader.seek_timecode_frame(frame_number)
 
     def get_last_timecode(self):
         return self._last_frame_timecode
