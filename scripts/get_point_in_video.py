@@ -10,8 +10,8 @@ from visual_race_timing.loader import VideoLoader, ImageLoader
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('source', type=pathlib.Path,
-                        help='video filepath, or a directory of images')
+    parser.add_argument('source', type=pathlib.Path, nargs='+',
+                        help='one or more video filepaths, or a single directory of images')
     parser.add_argument('--seek-frame', type=int,
                         help='seek frame (index from start)')
     parser.add_argument('--seek-timecode-frame', type=int,
@@ -25,10 +25,12 @@ def parse_opt():
 
 
 args = parse_opt()
-if args.source.is_dir():
-    loader = ImageLoader(args.source)
+if len(args.source) == 1 and args.source[0].is_dir():
+    loader = ImageLoader(args.source[0])
 else:
-    loader = VideoLoader([args.source])
+    if any(s.is_dir() for s in args.source):
+        raise SystemExit("Image directories cannot be combined with other sources; pass a single directory.")
+    loader = VideoLoader(args.source)
 
 if args.seek_time:
     if len(args.seek_time.split(':')) == 3 and ';' not in args.seek_time:
