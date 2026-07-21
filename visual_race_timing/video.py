@@ -30,7 +30,14 @@ def get_video_metadata(video_path: pathlib.Path) -> dict:
     logger.debug(f"Running command: {'  '.join(cmd)}")
 
     # Parse the JSON output
-    data = json.loads(result.stdout)
+    data = json.loads(result.stdout or '{}')
+
+    if result.returncode != 0 or not data.get('streams'):
+        stderr = result.stderr.decode('utf-8', 'replace').strip()
+        raise ValueError(
+            f"ffprobe could not read video metadata from {video_path}"
+            + (f": {stderr}" if stderr else "")
+        )
     return data
 
 
