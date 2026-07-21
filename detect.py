@@ -59,7 +59,7 @@ def run(args):
     if args.seek_time:
         if len(args.seek_time.split(':')) == 3 and ';' not in args.seek_time:
             args.seek_time += ":00"
-        loader.seek_timecode(args.seek_time)
+        loader.seek_time(args.seek_time)
     elif args.seek_frame:
         loader.seek_frame(args.seek_frame)
     elif args.seek_timecode_frame:
