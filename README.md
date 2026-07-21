@@ -22,10 +22,11 @@ Run scripts with `uv run <script>.py`, or activate the environment via `uv venv`
 ## Usage
 
 1. Record a video of the lap line. The video needs to have timecode metadata
-2. Run a detector over all frames (`detect.py`)
-3. Create an event configuration file (`config.yaml`)
-4. Annotate crossings (`annotate.py`)
-5. Collate the results (`collate.py`)
+2. Identify the finish line points with `scripts/get_point_in_video.py` 
+3. Run a detector over all frames (`detect.py`)
+4. Create an event configuration file (`config.yaml`)
+5. Annotate crossings (`annotate.py`)
+6. Collate the results (`collate.py`)
 
 Each of these scripts work on a _project_ directory, which directions with configuration, detection, and annotation
 files. The project directory is specified as the first argument to each script.
@@ -36,6 +37,19 @@ Aim for an elevated, static perspective of the finish line. 30fps/1080p is passa
 
 The video needs to have start timecode metadata set to a global reference. Frame numbers in this timecode are used to
 key detections and annotations.
+
+### Identifying the finish line points
+
+Before detecting, find where the finish line sits in the frame. Use `scripts/get_point_in_video.py` and click the
+two endpoints:
+
+```
+uv run python scripts/get_point_in_video.py data/DM26/DJI_20260606051302_0005_D.MP4
+```
+
+It prints both pixel and normalized `[x, y]` coordinates. Pass
+`--seek-time`/`--seek-frame`/`--seek-timecode-frame` to jump to a particular moment before clicking. These points feed the `finish_line` key in
+`config.yaml`, and they also tell you the region to crop, which the detector needs next.
 
 ### Running the detector
 
@@ -112,16 +126,16 @@ and neither win nor lose ground.
 
 A transport bar is docked below the frame. Its cells are clickable and dispatch the same
 commands as the shortcuts below: seek steppers for `Frame`, `Detection` (nearest on-line detection),
-`Annot`, and `Smart` (nearest inferred crossing); `-10s`/`+10s` jumps; play/pause; and a playback-speed
+`Annot`, and `Smart` (nearest inferred crossing); `-2.5s`/`+2.5s` jumps; play/pause; and a playback-speed
 readout with `-`/`+`.
 
 While the GUI window has focus, you can use the following keyboard commands:
 
 | Input                                | Action                                                                             |
 |--------------------------------------|-------------------------------------------------------------------------------------|
-| `left click` on detection            | Promote detection to annotation                                                     |
+| `left click` on detection            | Promote detection to annotation (CLI prompt to pick/confirm runner ID from ReID candidates) |
 | `left click` on annotation           | Begin edit (CLI prompt for command)                                                 |
-| `left click` + `shift` on detection  | Promote detection to annotation crossing                                            |
+| `left click` + `shift` on detection  | Promote detection to a crossing, auto-accepting the top ReID guess (no prompt)       |
 | `left click` + `shift` on annotation | Mark annotation as crossing                                                         |
 | `left click` + `ctrl` on annotation  | Mark annotation as crossing and reassign runner ID, propagated to nearby frames (via CLI) |
 | `right click` -> drag -> release     | Create annotation with start and end corners                                        |
@@ -137,7 +151,7 @@ While the GUI window has focus, you can use the following keyboard commands:
 | `(` or `)`                           | Prev/next frame                                                                      |
 | `s`                                  | Seek to timecode (via `HH:MM:SS` CLI input)                                          |
 | \`                                   | Create note annotation (via CLI)                                                     |
-| `,` or `.`                           | Jump backward/forward 10s                                                            |
+| `,` or `.`                           | Jump backward/forward 2.5s                                                            |
 | `Space`                              | Pause/Play video                                                                     |
 | `+` or `-`                           | Increase/decrease playback speed                                                     |
 
