@@ -158,6 +158,32 @@ class ReIDBank:
         sorted_dists = [float(d) for d in dists[order]]
         return sorted_ids, sorted_dists
 
+    def guess_batch(self, img: np.ndarray, boxes) -> List[Tuple[List[int], List[float]]]:
+        """Full closest-first ranking for each of N xyxy boxes in one extractor call.
+
+        Returns a length-N list (input order) of ``(sorted_ids, sorted_dists)``,
+        each mirroring :meth:`guess`. Entries are ``([], [])`` when the bank is
+        empty. One extractor forward pass covers all boxes.
+        """
+        boxes = np.atleast_2d(np.asarray(boxes, dtype=np.float32))[:, :4]
+        n = len(boxes)
+        if n == 0:
+            return []
+        if len(self.ids) == 0:
+            return [([], []) for _ in range(n)]
+        feats = np.asarray(self.extractor(img, boxes=boxes), dtype=np.float32)  # (N, D)
+        norms = np.linalg.norm(feats, axis=1, keepdims=True)
+        norms[norms == 0.0] = 1.0
+        feats = feats / norms
+        dists = np.maximum(0.0, 1.0 - feats @ self.feats.T)  # (N, M)
+        order = np.argsort(dists, axis=1)  # (N, M) closest-first
+        out = []
+        for i in range(n):
+            row = order[i]
+            out.append(([int(self.ids[j]) for j in row],
+                        [float(dists[i, j]) for j in row]))
+        return out
+
     # -- mutation ----------------------------------------------------------
     def update(self, img: np.ndarray, box, runner_id: int) -> None:
         """EMA-blend the crop's embedding into ``runner_id``'s row.

@@ -59,9 +59,9 @@ class TransportBar:
         return [
             {'type': 'stepper', 'id': 'frame', 'label': 'Frame', 'prev': ord('('), 'next': ord(')')},
             {'type': 'sep'},
-            {'type': 'jump', 'label': '-10s', 'key': ord(',')},
+            {'type': 'jump', 'label': '-2.5s', 'key': ord(',')},
             {'type': 'play'},
-            {'type': 'jump', 'label': '+10s', 'key': ord('.')},
+            {'type': 'jump', 'label': '+2.5s', 'key': ord('.')},
             {'type': 'sep'},
             {'type': 'speed'},
         ]

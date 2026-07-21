@@ -89,6 +89,34 @@ def draw_annotation(
         return annotator.result()
 
 
+def draw_scaled_labels(frame, local_boxes, labels, bg_colors, txt_colors):
+    """Draw each box's label with a font scaled to the box width (clamped to
+    a legible range for the frame's resolution), so text stays proportional
+    to the bbox instead of using the annotator's one global size. Used for
+    both the detection guesses and the human/crossing annotations.
+    ``bg_colors``/``txt_colors`` are per-box BGR tuples."""
+    fh = frame.shape[0]
+    lo, hi = 0.30 * fh / 1080, 1.0 * fh / 1080
+    for box, label, bg, fg in zip(local_boxes, labels, bg_colors, txt_colors):
+        if not label:
+            continue
+        x1, y1, x2, y2 = box[:4].astype(int)
+        bw = max(1, x2 - x1)
+        (tw1, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 1)
+        scale = float(np.clip(bw / tw1, lo, hi))
+        thickness = max(1, round(scale * 2))
+        (tw, th), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+        tx = max(0, x1)
+        # Prefer above the box; drop inside the top if it would clip off-frame.
+        ty = y1 - base - 2
+        if ty - th < 0:
+            ty = y1 + th + 2
+        cv2.rectangle(frame, (tx, ty - th - base), (tx + tw, ty + base), bg, -1)
+        cv2.putText(frame, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, scale,
+                    fg, thickness, cv2.LINE_AA)
+    return frame
+
+
 def get_monospace_font_path():
     """
     Get the path to the best available monospace font with fallback chain:

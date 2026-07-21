@@ -14,7 +14,7 @@ from ultralytics.engine.results import Boxes
 from ultralytics.utils.metrics import bbox_ioa
 
 from visual_race_timing.annotations import SQLiteAnnotationStore
-from visual_race_timing.drawing import draw_annotation
+from visual_race_timing.drawing import draw_annotation, draw_scaled_labels
 from visual_race_timing.proxy import find_proxy
 from visual_race_timing.reid_bank import DEFAULT_REID_WEIGHTS, ReIDBank, available_reid_models, build_extractor
 from visual_race_timing.race_config import assign_start_by_runner, build_start_realtime, get_finish_line
@@ -101,6 +101,53 @@ def run(args):
     if args.seek_time:
         player.seek_time(args.seek_time)
 
+    # Per-frame cache of the ReID top-1 guess drawn on each detection box, so
+    # re-renders of the same frame (e.g. after a click) don't re-run the model.
+    _det_guess_cache = {"frame": None, "labels": None}
+
+    def invalidate_det_guesses():
+        _det_guess_cache["frame"] = None
+        _det_guess_cache["labels"] = None
+
+    def detection_guess_labels(frame_num, local_boxes):
+        """Label each detection box with the ReID bank's top guess
+        ('bib name  0.31'), falling back to the detection confidence when the
+        bank has no opinion. Detections on/near the finish line get the same
+        timing-prior fusion a crossing confirm applies, so the shown id matches
+        what a (shift-)ctrl-click would commit. Computed once per frame (cached)
+        and only when the model output is shown, i.e. while paused."""
+        if local_boxes.size == 0:
+            return None
+        if _det_guess_cache["frame"] == frame_num:
+            return _det_guess_cache["labels"]
+
+        rankings = bank.guess_batch(player._last_frame_img, local_boxes[:, :4])
+
+        # Which detections are on the line -> fuse the timing prior for those
+        fps = player.get_last_timecode().framerate
+        h, w = player._last_frame_img.shape[:2]
+        line = get_finish_line(race_config, Timecode(fps, frames=frame_num),
+                               frame_width=w, frame_height=h)
+        on_line = line_segment_to_box_distance(line[0], line[1], local_boxes[:, :4]) < 10
+        t = Timecode(fps, frames=frame_num).to_realtime(as_float=True)
+
+        labels = []
+        for i in range(len(local_boxes)):
+            ids, dists = rankings[i]
+            if not ids:
+                labels.append(f"{local_boxes[i, 5]:.2f}")
+                continue
+            if on_line[i]:
+                ids, dists, _ = fuse_ranking(get_timing_prior(), ids, dists, t)
+            gid, gdist = ids[0], dists[0]
+            bib = format(gid, '02x')
+            name = race_config['participants'].get(gid)
+            first = name.split(" ")[0] if name else bib
+            labels.append(f"{bib} {first} {gdist:.2f}")
+        _det_guess_cache["frame"] = frame_num
+        _det_guess_cache["labels"] = labels
+        return labels
+
     def overlay_annotations(frame, frame_num):
         # Denormalize against the loader's original dims, not frame.shape,
         # then shift into frame's own (possibly offset) pixel space.
@@ -117,22 +164,53 @@ def run(args):
         frame_detection_boxes, frame_detection_keypoints = _shift_to_local(
             frame_detection_boxes, frame_detection_keypoints, offset_x, offset_y)
 
+        # Drop only detections whose box *matches* a crossing box
+        if frame_detection_boxes.size > 0 and frame_annotation_boxes.size > 0:
+            crossing_mask = np.asarray(frame_annotation_crossings, dtype=bool)
+            if crossing_mask.any():
+                det = frame_detection_boxes[:, :4]                       # (D, 4)
+                cross = frame_annotation_boxes[crossing_mask, :4]        # (C, 4)
+                corner_diff = np.abs(det[:, None, :] - cross[None, :, :]).max(axis=2)  # (D, C)
+                keep = ~(corner_diff <= 1.0).any(axis=1)
+                frame_detection_boxes = frame_detection_boxes[keep]
+                frame_detection_crossings = np.asarray(frame_detection_crossings)[keep]
+                if frame_detection_keypoints is not None:
+                    frame_detection_keypoints = frame_detection_keypoints[keep]
+
         if frame_detection_boxes.size > 0:
+            # While paused, label each detection with the ReID guess so it can be
+            # confirmed by (ctrl-)click without reading the keyboard prompt.
+            det_labels = detection_guess_labels(frame_num, frame_detection_boxes) if player.paused else None
+            # Draw the green boxes/keypoints via the shared annotator, but render
+            # the guess labels ourselves (below) so their font scales with the box.
             frame = draw_annotation(img=frame, boxes=frame_detection_boxes, keypoints=frame_detection_keypoints,
                                     crossings=frame_detection_crossings, labels=None,
-                                    conf=frame_detection_boxes[:, 4],
+                                    conf=None if det_labels else frame_detection_boxes[:, 4],
                                     kpt_radius=2 * frame.shape[0] // 1080,
                                     colors=[(0, 255, 0)] * len(frame_detection_boxes),
                                     line_width=1 * frame.shape[0] // 1080)
+            if det_labels:
+                bg = [(0, 200, 0)] * len(frame_detection_boxes)
+                fg = [(0, 0, 0)] * len(frame_detection_boxes)
+                frame = draw_scaled_labels(frame, frame_detection_boxes, det_labels, bg, fg)
         if frame_annotation_boxes.size > 0:
             ids = frame_annotation_boxes[:, 4].astype(int)
             bibs = [format(runner_id, '02x') for runner_id in ids]
             names = [race_config['participants'].get(runner_id, None) for runner_id in ids]
             names = [name.split(" ")[0] if name else bib for bib, name in zip(bibs, names)]
             labels = [f"{bib}{' ' + name if name else ''}" for bib, name in zip(bibs, names)]
+            # Draw the boxes/keypoints via the shared annotator (labels=None), then
+            # render the labels ourselves so they scale with the bbox. Mirror the
+            # annotator's colors: crossings get a black box + white text, others
+            # the default red box + black text.
+            crossing_flags = list(frame_annotation_crossings) if frame_annotation_crossings is not None else []
+            crossing_flags += [False] * (len(frame_annotation_boxes) - len(crossing_flags))
+            bg = [(0, 0, 0) if c else (0, 0, 255) for c in crossing_flags]
+            fg = [(255, 255, 255) if c else (0, 0, 0) for c in crossing_flags]
             frame = draw_annotation(img=frame, boxes=frame_annotation_boxes, keypoints=frame_annotation_keypoints,
-                                    crossings=frame_annotation_crossings, labels=labels,
+                                    crossings=frame_annotation_crossings, labels=None,
                                     kpt_radius=2 * frame.shape[0] // 1080, line_width=1 * frame.shape[0] // 1080)
+            frame = draw_scaled_labels(frame, frame_annotation_boxes, labels, bg, fg)
         if frame_notes is not None:
             for i, (runner_id, note) in enumerate(frame_notes.items()):
                 frame = cv2.putText(frame, f"{runner_id}: {note}", (10 + 10 * i, 10 * frame.shape[0] // 1080),
@@ -150,6 +228,8 @@ def run(args):
             # new_box is in full-frame coords; shift to match _last_frame_img.
             local_box, _ = _shift_to_local(new_box.copy(), None, *player.frame_offset())
             bank.update(player._last_frame_img, local_box, runner_id)
+            # Bank changed -> the drawn detection guesses are now stale.
+            invalidate_det_guesses()
         return True
 
     # --- Timing prior -------------------------------------------------------
@@ -162,6 +242,8 @@ def run(args):
     def invalidate_timing_prior():
         _timing["prior"] = None
         _timing["crossing_frames"] = None
+        # On-line detection labels are fused with the prior, so they're stale too.
+        invalidate_det_guesses()
 
     def refresh_marks():
         """Repaint the transport density strip from current crossing annotations."""
@@ -296,8 +378,8 @@ def run(args):
         if annotation_id is None:
             emb_dists, candidate_participants = calculate_reid_distances(
                 new_box, timecode=timecode, crossing=crossing)
-            if force and emb_dists[0] < .15:
-                # Force reid to the first candidate
+            if force and emb_dists:
+                # Confirm the top candidate outright.
                 annotation_id = f"{candidate_participants[0]:02x}"
             else:
                 annotation_id = query_for_reid(emb_dists, candidate_participants)
@@ -317,11 +399,14 @@ def run(args):
 
     def key_delegate(frame, frame_num, key, runner_id: str = None):
         if key == ord(','):
-            # Jump back 10s
-            player.seek_timecode_frame(frame_num - 10 * round(float(player.get_last_timecode().framerate)))
+            # Jump back 2.5s
+            player.seek_timecode_frame(frame_num - round(2.5 * float(player.get_last_timecode().framerate)))
+            # This seek is slow; drop mashed jump keys so they don't queue up.
+            player.flush_input()
         elif key == ord('.'):
-            # Jump forward 10s
-            player.seek_timecode_frame(frame_num + 10 * round(float(player.get_last_timecode().framerate)))
+            # Jump forward 2.5s
+            player.seek_timecode_frame(frame_num + round(2.5 * float(player.get_last_timecode().framerate)))
+            player.flush_input()
         elif key == ord('`'):
             # Make a new note
             # Get runner id
@@ -636,17 +721,28 @@ def run(args):
         inside = [box[0] < click_pt[0] < box[2] and box[1] < click_pt[1] < box[3] for box in detected_boxes]
         if len(inside) == 0 or not any(inside):
             return
-        if np.sum(inside) > 1:
-            print("Multiple boxes found, please click inside only one box.")
-            return
-        clicked_box = detected_boxes[np.where(inside)[0][0]]
+        idxs = np.where(inside)[0]
+        if len(idxs) > 1:
+            # Disambiguate rather than refuse: pick the tightest box,
+            # tie-broken by confidence, instead of forcing an impossible precise
+            # click.
+            sel = detected_boxes[idxs]
+            areas = np.rint((sel[:, 2] - sel[:, 0]) * (sel[:, 3] - sel[:, 1]))
+            order = sorted(range(len(idxs)), key=lambda k: (areas[k], -sel[k, 5]))
+            chosen = idxs[order[0]]
+            logger.info(f"{len(idxs)} overlapping detections at click; using tightest/highest-conf box.")
+        else:
+            chosen = idxs[0]
+        clicked_box = detected_boxes[chosen]
         if flags & cv2.EVENT_FLAG_ALTKEY:
             guess_crossing_and_seek(frame_num, clicked_box)
             return
-        # Shift click makes the new box a crossing too
+        # Shift-click confirms a crossing: it marks the box a crossing AND accepts
+        # the ReID guess drawn on the box (force), so the common crossing-confirm
+        # is keyboard-free.
+        shift = (flags & cv2.EVENT_FLAG_SHIFTKEY) > 0
         player.annotation_updated(None, [clicked_box[0:2], clicked_box[2:4]], player.get_last_timecode(),
-                                  crossing=((flags & cv2.EVENT_FLAG_SHIFTKEY) > 0),
-                                  force=((flags & cv2.EVENT_FLAG_CTRLKEY) > 0))
+                                  crossing=shift, force=shift)
         return
 
     player.click_delegate = click_delegate
@@ -661,10 +757,11 @@ def run(args):
     # Density strip: click to seek, filled by crossing annotations.
     player.transport.set_timeline(*player.loader.get_frame_range())
     refresh_marks()
-    player.play()
-    cv2.waitKey(0)
-    logger.info("Saving reid bank...")
-    bank.save(args.project / 'reid_bank.npz')
+    try:
+        player.play()
+    finally:
+        logger.info("Saving reid bank...")
+        bank.save(args.project / 'reid_bank.npz')
 
 
 def parse_opt():
