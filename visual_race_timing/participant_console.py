@@ -17,6 +17,7 @@ _CELL = (60, 60, 66)
 _SEP = (78, 78, 86)
 _TEXT = (232, 232, 232)
 _PREDICT = (60, 180, 240)   # amber: playhead past this runner's last confirmed crossing
+_FOCUS_BG = (55, 78, 92)    # subtle warm highlight behind a focused runner's label
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 _SCALE = 0.5
 
@@ -31,14 +32,20 @@ class ParticipantConsole:
         """participants: dict mapping runner id (int) -> full name (str)."""
         self.participants = dict(participants)
         self.visible = True
+        self.focused_rid = None  # runner id whose label is highlighted, or None
         self._buttons = []   # (x0, y0, x1, y1, rid, direction), composed-image coords
+        self._label_rects = []  # (x0, y0, x1, y1, rid), composed-image coords
         self._above_h = 0    # height of the image the pane was stacked under
 
     def hit(self, x, y):
-        """Return ('runner_seek', rid, direction) for a click on an arrow, else None."""
+        """Return ('runner_seek', rid, direction) for a click on an arrow, or
+        ('focus', rid) for a click on a bib/name label; else None."""
         for (x0, y0, x1, y1, rid, direction) in self._buttons:
             if x0 <= x <= x1 and y0 <= y <= y1:
                 return ('runner_seek', rid, direction)
+        for (x0, y0, x1, y1, rid) in self._label_rects:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return ('focus', rid)
         return None
 
     def compose(self, image, rows):
@@ -49,6 +56,7 @@ class ParticipantConsole:
         w = image.shape[1]
         self._above_h = image.shape[0]
         self._buttons = []
+        self._label_rects = []
         rows = list(rows)
         cols = max(1, w // _COL_W_MIN)
         n = len(rows)
@@ -57,7 +65,7 @@ class ParticipantConsole:
         pane = np.full((pane_h, w, 3), _BG, dtype=np.uint8)
         col_w = (w - 2 * _PAD) // cols
         for i, row in enumerate(rows):
-            c, r = i % cols, i // cols
+            c, r = i // n_grid_rows, i % n_grid_rows
             self._draw_row(pane, row, _PAD + c * col_w, _PAD + r * _ROW_H, col_w)
         return np.vstack([image, pane])
 
@@ -76,6 +84,9 @@ class ParticipantConsole:
     def _button(self, x0, y0, x1, y1, rid, direction):
         # Hit rects are offset by the height of the image the pane sits under.
         self._buttons.append((x0, y0 + self._above_h, x1, y1 + self._above_h, rid, direction))
+
+    def _label(self, x0, y0, x1, y1, rid):
+        self._label_rects.append((x0, y0 + self._above_h, x1, y1 + self._above_h, rid))
 
     def _truncate(self, text, max_w):
         if cv2.getTextSize(text, _FONT, _SCALE, 1)[0][0] <= max_w:
@@ -100,6 +111,13 @@ class ParticipantConsole:
         prev_x1 = count_x0 - 8
         prev_x0 = prev_x1 - _BTN_W
 
+        # Bib/name label cell: clickable to focus this runner. Highlight it
+        # first so the text draws on top.
+        label_x0, label_x1 = x0, prev_x0 - 8
+        if rid == self.focused_rid:
+            cv2.rectangle(pane, (label_x0, y_top), (label_x1, y_bot), _FOCUS_BG, -1)
+        self._label(label_x0, y_top, label_x1, y_bot, rid)
+
         # Prev / next arrow cells.
         self._cell(pane, prev_x0, y_top, prev_x1, y_bot)
         self._arrow(pane, (prev_x0 + prev_x1) // 2, cy, left=True)
@@ -115,6 +133,6 @@ class ParticipantConsole:
         bib = format(rid, '02x')
         name = self.participants.get(rid) or ''
         first = name.split(' ')[0] if name else ''
-        label = self._truncate(f"{bib} {first}".strip(), prev_x0 - (x0 + 4) - 8)
+        label = self._truncate(f"{bib} {first}".strip(), label_x1 - (x0 + 4))
         (_, lth), _ = cv2.getTextSize(label, _FONT, _SCALE, 1)
         cv2.putText(pane, label, (x0 + 4, cy + lth // 2), _FONT, _SCALE, color, 1, cv2.LINE_AA)

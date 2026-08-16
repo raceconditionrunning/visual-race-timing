@@ -17,6 +17,10 @@ class MediaPlayer:
         self.pre_display = lambda frame, frame_number: frame
         self.key_delegate = lambda frame, frame_number, key: None
 
+        self.console = None
+        self.console_rows = lambda frame_number: []
+        self.console_action = lambda action: None
+
         self._last_frame_img = None
         # No matter what, we need to read the first frame
         self.needs_advance = 1
@@ -26,6 +30,7 @@ class MediaPlayer:
             self.paused = False
 
         self.delay = 30  # Initial delay in ms for playback speed
+        self.show_boxes = True  # gates bbox drawing in pre_display; toggled via the transport checkbox
         self.annotation_mode = False
         self.start_point = None
         self.end_point = None
@@ -80,6 +85,8 @@ class MediaPlayer:
         if self.transport.visible:
             display_frame = self.transport.compose(display_frame, paused=self.paused, delay=self.delay,
                                                     current_frame=current_timecode.frames)
+        if self.console is not None and self.console.visible:
+            display_frame = self.console.compose(display_frame, self.console_rows(current_timecode.frames))
         cv2.imshow(self.window_name, display_frame)
 
     def mouse_callback(self, event, x, y, flags, param):
@@ -94,6 +101,11 @@ class MediaPlayer:
                 if self.paused:
                     self.render()
                 return
+            if self.console is not None and self.console.visible:
+                action = self.console.hit(x, y)
+                if action is not None:
+                    self.console_action(action)
+                    return
             # Scrubbing the density strip: seek to the clicked frame. Mirrors the
             # seek-then-advance idiom used by the annotation seek shortcuts.
             seek_frame = self.transport.hit_timeline(x, y)
@@ -191,6 +203,11 @@ class MediaPlayer:
             self.delay = max(1, self.delay - 5)
         elif key == ord('-'):  # Decrease playback speed
             self.delay += 5
+        elif key == ord('b'):  # Toggle bbox visibility
+            self.show_boxes = not self.show_boxes
+        elif key == ord('p'):  # Toggle participant console visibility
+            if self.console is not None:
+                self.console.visible = not self.console.visible
         else:
             self.key_delegate(self._last_frame_img, self.get_last_timecode().frames, key)
 
@@ -233,6 +250,7 @@ class VideoPlayer(MediaPlayer):
 
         while True:
             if self.needs_advance:
+                stepped_back = self.needs_advance < 0
                 if self.needs_advance < 0:
                     success = self.seek_timecode(self.get_last_timecode() - 1)
                     if not success:

@@ -25,6 +25,7 @@ _HINT_SCALE = 0.32
 _TL_TRACK = (50, 50, 56)     # strip background (BGR)
 _TL_FILL = (150, 200, 110)   # crossing density (soft green)
 _TL_HEAD = (245, 245, 245)   # playhead
+_TL_FOCUS_TICK = (60, 180, 240)  # per-lap tick when a single runner is focused (matches the console's amber)
 _TL_PAD = 12                 # horizontal inset of the track within the strip
 _TL_BINS = 320               # density resolution, independent of pixel width
 
@@ -43,6 +44,8 @@ class TransportBar:
         self.visible = True
         # Declarative widget list; callers extend it via add_seek_steppers.
         self.groups = self._default_groups()
+        # Right-anchored checkbox toggles (e.g. "show bboxes"), added via add_toggle.
+        self.right_widgets = []
         self._buttons = []   # (x0, y0, x1, y1, key), composed-image coords
         self._frame_h = None  # frame height of the last compose (bar sits below)
         self._buttons_y_offset = 0  # window-y of the control row's top
@@ -51,6 +54,7 @@ class TransportBar:
         self._tl_start = None      # first absolute frame number
         self._tl_end = None        # last absolute frame number
         self._tl_density = None    # np array, len _TL_BINS, normalized 0..1
+        self._tl_focus_frames = None  # None -> aggregate density; else per-runner tick marks
         self._tl_rect = None       # (x0, y0, x1, y1) hit rect in window coords
 
     def _default_groups(self):
@@ -70,6 +74,10 @@ class TransportBar:
         """Insert extra seek-granularity steppers just after the Frame stepper."""
         idx = next((i for i, g in enumerate(self.groups) if g.get('id') == 'frame'), 0) + 1
         self.groups[idx:idx] = steppers
+
+    def add_toggle(self, label, key, checked_fn):
+        """Add a checkbox docked to the right edge of the button row."""
+        self.right_widgets.append({'label': label, 'key': key, 'checked_fn': checked_fn})
 
     def set_timeline(self, start_frame, end_frame):
         """Enable the density strip over the [start_frame, end_frame] frame span.
@@ -97,6 +105,10 @@ class TransportBar:
         smoothed = np.convolve(hist.astype(float), kernel, mode='same')
         peak = smoothed.max()
         self._tl_density = smoothed / peak if peak > 0 else smoothed
+
+    def set_focus_marks(self, frames):
+        """Switch the density strip to tick marks at ``frames`` """
+        self._tl_focus_frames = None if frames is None else np.asarray(list(frames), dtype=float)
 
     def in_chrome(self, y):
         """True if a window y-coordinate falls on the bar rather than the frame."""
@@ -135,6 +147,10 @@ class TransportBar:
         for widget in self.groups:
             x = self._draw_widget(bar, widget, x, cy, h, paused, delay) + 14
 
+        rx = w - 12
+        for widget in reversed(self.right_widgets):
+            rx = self._draw_checkbox(bar, widget, rx, cy, h) - 14
+
         if strip_h:
             strip = self._draw_timeline(w, strip_h, current_frame)
             return np.vstack([display_frame, strip, bar])
@@ -149,7 +165,9 @@ class TransportBar:
         track_w, track_h = x1 - x0, y1 - y0
         cv2.rectangle(strip, (x0, y0), (x1, y1), _TL_TRACK, -1)
 
-        if self._tl_density is not None and track_w > 1 and track_h > 1:
+        if self._tl_focus_frames is not None:
+            self._draw_focus_ticks(strip, x0, x1, y0, y1)
+        elif self._tl_density is not None and track_w > 1 and track_h > 1:
             cols = np.arange(track_w)
             bins = (cols / track_w * len(self._tl_density)).astype(int)
             bins = np.clip(bins, 0, len(self._tl_density) - 1)
@@ -169,6 +187,18 @@ class TransportBar:
             cv2.fillPoly(strip, [tri], _TL_HEAD)
         return strip
 
+    def _draw_focus_ticks(self, strip, x0, x1, y0, y1):
+        """Draw one full-height tick per frame in ``_tl_focus_frames``"""
+        if self._tl_start is None or self._tl_end <= self._tl_start:
+            return
+        track_w = x1 - x0
+        frames = self._tl_focus_frames
+        frames = frames[(frames >= self._tl_start) & (frames <= self._tl_end)]
+        for f in frames:
+            frac = (f - self._tl_start) / (self._tl_end - self._tl_start)
+            tx = x0 + int(round(frac * track_w))
+            cv2.line(strip, (tx, y0), (tx, y1), _TL_FOCUS_TICK, 2)
+
     # -- drawing helpers -------------------------------------------------
     def _cell(self, bar, x0, y0, x1, y1):
         cv2.rectangle(bar, (x0, y0), (x1, y1), _CELL, -1)
@@ -182,6 +212,27 @@ class TransportBar:
         lbl = _key_label(key)
         (tw, _th), _ = cv2.getTextSize(lbl, _FONT, _HINT_SCALE, 1)
         cv2.putText(bar, lbl, (x1 - tw - 3, y1 - 3), _FONT, _HINT_SCALE, _HINT, 1, cv2.LINE_AA)
+
+    def _draw_checkbox(self, bar, widget, x1, cy, h):
+        """Draw a checkbox anchored so its right edge lands at x1 (box, then
+        label, growing leftward). Returns the widget's left edge, so callers
+        can chain further right_widgets further left."""
+        y0, y1 = 10, h - 10
+        box_s = 14
+        label = widget['label']
+        (tw, th), _ = cv2.getTextSize(label, _FONT, _SCALE, _THICK)
+        cw = box_s + 6 + tw + 8
+        x0 = x1 - cw
+        bx0, by0 = x0 + 4, cy - box_s // 2
+        bx1, by1 = bx0 + box_s, by0 + box_s
+        cv2.rectangle(bar, (bx0, by0), (bx1, by1), _SEP, 1)
+        if widget['checked_fn']():
+            cv2.line(bar, (bx0 + 2, cy), (bx0 + 5, by1 - 2), _TEXT, 2)
+            cv2.line(bar, (bx0 + 5, by1 - 2), (bx1 - 2, by0 + 2), _TEXT, 2)
+        cv2.putText(bar, label, (bx1 + 6, cy + th // 2), _FONT, _SCALE, _TEXT, _THICK, cv2.LINE_AA)
+        off = self._buttons_y_offset
+        self._buttons.append((x0, y0 + off, x1, y1 + off, widget['key']))
+        return x0
 
     def _arrow(self, bar, cx, cy, left=True, s=5):
         if left:
