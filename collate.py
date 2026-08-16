@@ -2,6 +2,7 @@
 import argparse
 import json
 import pathlib
+import re
 from collections import defaultdict
 
 import cv2
@@ -56,6 +57,20 @@ def camelize(obj):
     if isinstance(obj, (list, tuple)):
         return [camelize(x) for x in obj]
     return obj
+
+
+def dump_json_with_compact_arrays(obj, f, array_keys):
+    text = json.dumps(obj, default=timecode_serializer, indent=2)
+    for key in array_keys:
+        pattern = re.compile(r'("%s":\s*)\[\s*(.*?)\s*\]' % re.escape(key), re.DOTALL)
+
+        def collapse(m):
+            items = [item.strip() for item in m.group(2).split(',') if item.strip()]
+            return f"{m.group(1)}[{', '.join(items)}]"
+
+        text = pattern.sub(collapse, text)
+    f.write(text)
+    f.write('\n')
 
 
 def main(args):
@@ -199,7 +214,7 @@ def main(args):
     del output["config"]["exclude"]
 
     with open(args.project / "results.json", "w") as f:
-        json.dump(camelize(round_floats(output)), f, default=timecode_serializer, indent=2)
+        dump_json_with_compact_arrays(camelize(round_floats(output)), f, array_keys=('lapTimes',))
 
 
 def parse_args():
